@@ -13,7 +13,8 @@
     "build:lambdas": "node scripts/lambda/build.mjs",
     "infra:apply": "npm run build:lambdas && terraform -chdir=infra apply -auto-approve",
     "infra:destroy": "terraform -chdir=infra destroy -auto-approve",
-    "infra:plan": "npm run build:lambdas && terraform -chdir=infra plan"
+    "infra:plan": "npm run build:lambdas && terraform -chdir=infra plan",
+    "loadtest": "node scripts/loadtest.mjs"
   },
   "keywords": [],
   "author": "",
