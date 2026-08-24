@@ -61,7 +61,7 @@ because the rule it implements is app-wide: everything that is not an accepted
 signal, including 404s no module owns. A hook, not a controller, is its caller.
 
 `workers/` is NOT part of the Fastify app — it is the other side of the queue.
-A worker is a Lambda `handler(event)`, deployed by `scripts/localstack/deploy-lambdas.sh`
+A worker is a Lambda `handler(event)`, provisioned by the Terraform in `infra/`
 and bundled by `scripts/lambda/build.mjs`, sharing only `config.ts`, the
 ClickHouse client and the `vent.schema` row types with the edge. It imports no
 plugin and no Fastify. Keep the handler thin over a pure `consume(client, event)`

@@ -224,8 +224,7 @@ All four queues (each has a `<name>_dlq` behind it at `maxReceiveCount: 5`) are
 **Standard, not FIFO**. Exactly-once would buy nothing — duplicates already
 collapse on `signal_id` in `ReplacingMergeTree`, which at-least-once redelivery
 requires anyway — while FIFO's 300/sec ceiling and mandatory `MessageGroupId`
-would both cost. The reasoning is in
-[scripts/localstack/ready.d/01-queues.sh](scripts/localstack/ready.d/01-queues.sh).
+would both cost. The queues are defined in [infra/queues.tf](infra/queues.tf).
 
 The message is **two ClickHouse rows and nothing else**:
 
@@ -296,8 +295,8 @@ Failure posture, and why it is the opposite of the accepted path's:
   acknowledging it is not survivable; losing an analytics row is.
 
 `DelaySeconds=60` on the queue is the hold — it is a **queue attribute**, set in
-`scripts/localstack/ready.d/01-queues.sh`, so messages pile up for a batching
-consumer. The publisher sets no per-message delay and does not know the number.
+[infra/queues.tf](infra/queues.tf), so messages pile up for a batching consumer.
+The publisher sets no per-message delay and does not know the number.
 
 ## The consumers
 
@@ -311,8 +310,9 @@ topology its queue wants. They are the mirror image of each other:
 
 Pending is low-urgency analytics, so one consumer drains a 60s window in big
 batches; accepted is billable, so N consumers clear it as fast as it fills. The
-topology lives in [scripts/localstack/deploy-lambdas.sh](scripts/localstack/deploy-lambdas.sh),
-not the handler code — a handler does not know how many of it are running.
+topology lives in the Terraform ([infra/lambdas.tf](infra/lambdas.tf), sized by
+the variables in [infra/variables.tf](infra/variables.tf)), not the handler code
+— a handler does not know how many of it are running.
 
 Things that are load-bearing here:
 
@@ -339,10 +339,13 @@ Things that are load-bearing here:
   the `handler` export under `undici`'s own `module.exports`. See
   `scripts/lambda/build.mjs`.
 
-Deploy with `npm run deploy:lambdas` (LocalStack up, ClickHouse up). The handler
-logic is a pure function over a client (`consumePending` / `consumeAccepted`),
-tested with a fake in `src/workers/workers.test.ts`; the deployment is verified
-against the live containers.
+Provision with `npm run infra:apply` — it bundles the handlers and runs
+`terraform -chdir=infra apply`, which owns the queues, the functions and the
+event-source mappings (see [infra/](infra/)). `docker compose up` no longer
+creates any AWS resources; Terraform does. The handler logic is a pure function
+over a client (`consumePending` / `consumeAccepted`), tested with a fake in
+`src/workers/workers.test.ts`; the deployment is verified against the live
+containers.
 
 ## Repository state
 

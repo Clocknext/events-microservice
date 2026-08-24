@@ -11,7 +11,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:watch": "node --import tsx --test --watch",
     "build:lambdas": "node scripts/lambda/build.mjs",
-    "deploy:lambdas": "bash scripts/localstack/deploy-lambdas.sh"
+    "infra:apply": "npm run build:lambdas && terraform -chdir=infra apply -auto-approve",
+    "infra:destroy": "terraform -chdir=infra destroy -auto-approve",
+    "infra:plan": "npm run build:lambdas && terraform -chdir=infra plan"
   },
   "keywords": [],
   "author": "",

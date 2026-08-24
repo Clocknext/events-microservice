@@ -1,6 +1,13 @@
 node_modules/
 dist/
 dist-lambda/
+
+# terraform: local state, provider plugins, plans. The .tf files ARE committed.
+infra/.terraform/
+infra/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
 *.log
 .env
 .env.*

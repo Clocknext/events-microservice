@@ -17,9 +17,9 @@ services:
     volumes:
       - "${LOCALSTACK_VOLUME_DIR:-./volume}:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock"
-      # Run once the gateway is up. Creates the signal pipeline's queues and
-      # their DLQs, so they exist before the service ever publishes to them.
-      - "./scripts/localstack/ready.d:/etc/localstack/init/ready.d"
+      # Queues and Lambdas are NOT created here anymore — Terraform (infra/) owns
+      # them. `docker compose up` gives you an empty LocalStack; `terraform apply`
+      # provisions the queues, the consumers and their event-source mappings.
 
   clickhouse:
     container_name: clickhouse
