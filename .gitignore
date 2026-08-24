@@ -5,6 +5,7 @@ dist/
 .env.*
 !.env.example
 .DS_Store
+.vscode/
 
 # LocalStack's runtime state, recreated on every container start. Holds the
 # generated root CA and server private keys, and the license file.

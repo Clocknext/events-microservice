@@ -1,0 +1,53 @@
+services:
+  localstack:
+    container_name: "${LOCALSTACK_DOCKER_NAME:-localstack-main}"
+    image: localstack/localstack
+    ports:
+      - "127.0.0.1:4566:4566" # LocalStack Gateway
+      - "127.0.0.1:4510-4559:4510-4559" # external services port range
+    environment:
+      # Activate LocalStack for AWS: https://docs.localstack.cloud/getting-started/auth-token/
+      - LOCALSTACK_AUTH_TOKEN=ls-nuqU6334-nEko-yuqu-jEHE-LeRU68222120 # required for Pro
+      # LocalStack configuration: https://docs.localstack.cloud/references/configuration/
+      - DEBUG=${DEBUG:-0}
+    volumes:
+      - "${LOCALSTACK_VOLUME_DIR:-./volume}:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      # Run once the gateway is up. Creates the signal pipeline's queues and
+      # their DLQs, so they exist before the service ever publishes to them.
+      - "./scripts/localstack/ready.d:/etc/localstack/init/ready.d"
+
+  clickhouse:
+    container_name: clickhouse
+    image: clickhouse/clickhouse-server:25.3
+    ports:
+      - "127.0.0.1:8123:8123" # HTTP — what the client and `curl` use
+      - "127.0.0.1:9000:9000" # native protocol — clickhouse-client
+    environment:
+      - CLICKHOUSE_DB=signals
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      # Without this the default user is created without the grants needed to
+      # create tables, and the init script fails with a bare "not enough privileges".
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      # Applied on FIRST START ONLY — ClickHouse skips this directory once the
+      # data volume exists. `docker compose down -v` to re-apply after an edit.
+      - "./docker/clickhouse/init:/docker-entrypoint-initdb.d"
+      - "clickhouse-data:/var/lib/clickhouse"
+    ulimits:
+      # ClickHouse asks for a very high nofile and logs a warning under Docker's
+      # default. Not fatal, but it makes the startup log unreadable.
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  # A named volume rather than a bind mount: the server runs as uid 101 and a
+  # host-owned ./volume directory fails with permission errors on first start.
+  clickhouse-data:

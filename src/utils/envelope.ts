@@ -45,6 +45,10 @@ export type ErrorReason =
   // --- our side failed; the signal was never judged, so it is retryable ------
   | 'UPSTREAM_UNAVAILABLE'
   | 'EDGE_MISCONFIGURED'
+  /** The signal could not be put on the queue, so it is recorded nowhere. The
+   *  one failure that must not answer 202: `Processing in the queue.` would be
+   *  a promise we did not keep, and the caller would never resend. */
+  | 'QUEUE_UNAVAILABLE'
   | 'INTERNAL_ERROR'
 
 /** One rejected field, in the same shape `/api/internal/resolve` reports. */
@@ -66,6 +70,11 @@ export interface ErrorResult {
   /** Present only when a body was judged — every broken field, not just the
    *  first. Omitted rather than sent empty when nothing was judged. */
   issues?: SignalIssue[]
+  /** Our id for this request, stamped before anything could fail. Present on
+   *  every error the signal route answers, so even a hard rejection can be
+   *  quoted back to us and found. */
+  signalId?: string
+  receivedAt?: string
 }
 
 /* WHAT IS DELIBERATELY NOT HERE: the underlying cause of a 5xx. `errorReason`
@@ -118,6 +127,8 @@ export const errorResultSchema = {
   required: ['errorReason'],
   properties: {
     errorReason: { type: 'string' },
+    signalId: { type: 'string' },
+    receivedAt: { type: 'string' },
     issues: {
       type: 'array',
       items: {
