@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS signals.raw_signals
   received_at      DateTime64(3),                -- arrival time at the edge
   idempotency_key  Nullable(String),             -- caller's retry key, if sent
   api_key_id       String,                       -- which cnk_ key sent it
-  payload          String CODEC(ZSTD(3))         -- the request body, word for word; compressed because it is the only large column
+  payload          String CODEC(ZSTD(3)),        -- the request body, word for word; compressed because it is the only large column
+  batch_id         Nullable(String)              -- the consumer invocation that ingested this row; set by the accepted consumer, null on a pending (rejected) row
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(received_at)

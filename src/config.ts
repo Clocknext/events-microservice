@@ -54,6 +54,16 @@ export const config = {
    *  then means only "well-formed and authenticated" — nothing is queued. */
   acceptedQueueUrl: process.env.SQS_ACCEPTED_QUEUE_URL ?? '',
 
+  // --- clickhouse (the queue consumers write here) ---------------------------
+  /** Read by the SQS consumers, NOT the edge. Inside a LocalStack Lambda this is
+   *  `http://clickhouse:8123` — the container name on the shared docker network,
+   *  which is why the Lambda must run on that network (LAMBDA_DOCKER_NETWORK).
+   *  From the host it is `http://localhost:8123`. */
+  clickhouseUrl: process.env.CLICKHOUSE_URL ?? 'http://localhost:8123',
+  clickhouseDatabase: process.env.CLICKHOUSE_DATABASE ?? 'signals',
+  clickhouseUser: process.env.CLICKHOUSE_USER ?? 'default',
+  clickhousePassword: process.env.CLICKHOUSE_PASSWORD ?? '',
+
   // --- request limits --------------------------------------------------------
   /** Reject bodies over this size (Fastify bodyLimit -> 413). */
   bodyBytes: intFromEnv('BODY_BYTES', 64 * 1024),

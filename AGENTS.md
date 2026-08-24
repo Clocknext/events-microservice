@@ -20,9 +20,14 @@ root
     │   ├── redis.ts             decorates app.cache (KeyCache | null)
     │   ├── sqs.ts               decorates app.queue (SignalQueue | null)
     │   └── vent.ts              stamps every request; publishes every 4xx/5xx
-    ├── client/                  outbound HTTP to the payments app
+    ├── client/                  outbound HTTP
     │   ├── payments-client.ts   /api/internal/resolve, /api/internal/settle
-    │   └── types.ts             wire types for those endpoints
+    │   ├── clickhouse.ts        insert client, used by the workers not the edge
+    │   └── types.ts             wire types for the payments endpoints
+    ├── workers/                 SQS -> ClickHouse Lambda consumers (not the edge)
+    │   ├── pending.handler.ts   signals_pending  -> raw_signals + signal_status
+    │   ├── accepted.handler.ts  signals_accepted -> raw_signals + batch_id
+    │   └── lib/insert.ts        bulk insert, isolate the poison row on failure
     ├── utils/                   framework-agnostic helpers
     │   ├── envelope.ts          the public v1 response envelope + ErrorReason
     │   └── errors.ts            AppError + subclasses, each carrying a reason
@@ -54,6 +59,13 @@ The five-file shape is the rule for a module that owns routes; it is not a quota
 ClickHouse row shapes and a queue port. Its *adapter* is a plugin (`vent.ts`)
 because the rule it implements is app-wide: everything that is not an accepted
 signal, including 404s no module owns. A hook, not a controller, is its caller.
+
+`workers/` is NOT part of the Fastify app — it is the other side of the queue.
+A worker is a Lambda `handler(event)`, deployed by `scripts/localstack/deploy-lambdas.sh`
+and bundled by `scripts/lambda/build.mjs`, sharing only `config.ts`, the
+ClickHouse client and the `vent.schema` row types with the edge. It imports no
+plugin and no Fastify. Keep the handler thin over a pure `consume(client, event)`
+so it stays testable without a live database — see CLAUDE.md "The consumers".
 
 ## The five files in a module
 
@@ -127,12 +139,11 @@ routes through `inject`.
   the client in `onClose`. Services import that decorator, never their own client.
 - `modules/auth/` — resolution + caching are in place; there is no auth *route*
   and no session handling.
-- **Queue hand-off, accepted half.** The `signals_accepted` queue exists but
-  nothing publishes to it — `signal.service.ts` accepts a signal and returns it.
-  When the publisher lands it must send **before** the 202 and 502 on failure,
-  the reverse of the vent, which fails open. The *pending* half is done: see
-  "The reject vent" in CLAUDE.md.
-- **The ClickHouse side.** No client, no worker, no DDL. The vent's messages are
-  already shaped as `raw_signals` and `signal_status` rows, so what is missing is
-  a consumer that batches off SQS and bulk-inserts. Both tables must be
-  `ReplacingMergeTree` — the reasoning is in CLAUDE.md and is not optional.
+- **Both queue hand-offs are done.** The edge publishes to `signals_pending`
+  (from the vent) and `signals_accepted` (from `signal.controller.ts`, before the
+  202), and two Lambda consumers in `src/workers/` drain both into ClickHouse.
+  See "The consumers" in CLAUDE.md.
+- **`signal_status` for an accepted signal is still unwritten.** The accepted
+  consumer writes only `raw_signals.{signal_id, received_at, batch_id}` — the
+  money and status columns come later in the pipeline (settlement), which does
+  not exist yet.

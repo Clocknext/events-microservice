@@ -10,6 +10,10 @@ services:
       - LOCALSTACK_AUTH_TOKEN=ls-nuqU6334-nEko-yuqu-jEHE-LeRU68222120 # required for Pro
       # LocalStack configuration: https://docs.localstack.cloud/references/configuration/
       - DEBUG=${DEBUG:-0}
+      # Run Lambda containers ON this compose network, so a consumer can reach
+      # ClickHouse by its container name (http://clickhouse:8123). Without it the
+      # Lambda runs on a default bridge and cannot resolve `clickhouse`.
+      - LAMBDA_DOCKER_NETWORK=${LAMBDA_DOCKER_NETWORK:-aws-internal_default}
     volumes:
       - "${LOCALSTACK_VOLUME_DIR:-./volume}:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock"

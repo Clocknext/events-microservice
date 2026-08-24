@@ -218,7 +218,7 @@ There are two pipelines, one per outcome of a signal, and both queues exist:
 | Queue | Carries | Delay | Publisher |
 | --- | --- | --- | --- |
 | `signals_pending` | every response ≥ 400, as two rows with `status: PENDING` | 60s | `plugins/vent.ts` |
-| `signals_accepted` | every 202 | none | **not built yet** |
+| `signals_accepted` | every accepted 202, as `raw_signals.{signal_id, received_at}` | none | `signal.controller.ts` (before the 202) |
 
 All four queues (each has a `<name>_dlq` behind it at `maxReceiveCount: 5`) are
 **Standard, not FIFO**. Exactly-once would buy nothing — duplicates already
@@ -299,8 +299,50 @@ Failure posture, and why it is the opposite of the accepted path's:
 `scripts/localstack/ready.d/01-queues.sh`, so messages pile up for a batching
 consumer. The publisher sets no per-message delay and does not know the number.
 
-**Not built yet:** the worker, the ClickHouse client, the two `CREATE TABLE`s,
-and the publisher for `signals_accepted` — the queue exists, nothing sends to it.
+## The consumers
+
+Two Lambdas drain the two queues into ClickHouse (`src/workers/`), each with the
+topology its queue wants. They are the mirror image of each other:
+
+| Consumer | Queue | Concurrency | Batching | Writes |
+| --- | --- | --- | --- | --- |
+| `pending.handler` | `signals_pending` | **1** (reserved concurrency) | 60s window | `raw_signals` **then** `signal_status` |
+| `accepted.handler` | `signals_accepted` | **N** (`MaximumConcurrency`, default 5) | none | `raw_signals` + a `batch_id` |
+
+Pending is low-urgency analytics, so one consumer drains a 60s window in big
+batches; accepted is billable, so N consumers clear it as fast as it fills. The
+topology lives in [scripts/localstack/deploy-lambdas.sh](scripts/localstack/deploy-lambdas.sh),
+not the handler code — a handler does not know how many of it are running.
+
+Things that are load-bearing here:
+
+- **The message key is the table name**, so a consumer does
+  `insert(<key>, message[<key>])` and nothing else — no mapping. `pending.handler`
+  inserts `raw_signals` before `signal_status` because the second references the
+  first.
+- **Partial batch failure.** Both return `batchItemFailures` (the mappings set
+  `ReportBatchItemFailures`), so one poison message replays alone, not the whole
+  batch. `insertTagged` isolates it by retrying each row when the bulk insert
+  throws. Safe because both tables are `ReplacingMergeTree` — a re-inserted row
+  collapses on merge.
+- **`batch_id` is stamped by the accepted consumer, once per invocation** — a
+  `Nullable(String)` column, null on every pending row (a signal is accepted or
+  rejected, never both, so they never collide).
+- **ClickHouse must be inserted with `date_time_input_format=best_effort`**
+  ([src/client/clickhouse.ts](src/client/clickhouse.ts)), or the ISO-8601
+  `received_at` is rejected — the default `basic` format refuses the `T` and `Z`.
+- **The Lambda reaches ClickHouse by container name** (`http://clickhouse:8123`),
+  which only works because LocalStack runs the Lambda on the compose network
+  (`LAMBDA_DOCKER_NETWORK` in `docker-compose.yml`). Off that network the
+  consumer cannot resolve `clickhouse` and every insert times out.
+- **The bundle is ESM (`index.mjs`), not CJS.** Bundling the handler to CJS lost
+  the `handler` export under `undici`'s own `module.exports`. See
+  `scripts/lambda/build.mjs`.
+
+Deploy with `npm run deploy:lambdas` (LocalStack up, ClickHouse up). The handler
+logic is a pure function over a client (`consumePending` / `consumeAccepted`),
+tested with a fake in `src/workers/workers.test.ts`; the deployment is verified
+against the live containers.
 
 ## Repository state
 
