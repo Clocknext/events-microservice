@@ -229,58 +229,42 @@ would both cost. The queues are defined in [infra/queues.tf](infra/queues.tf).
 The message is **two ClickHouse rows and nothing else**:
 
 ```json
-{ "raw_signals":   { "signal_id": "01M0SE…", "organization_id": "", "customer_id": "cus_e2e",
-                     "received_at": "…", "idempotency_key": "idem_e2e", "api_key_id": "",
-                     "payload": "{\"customerId\":\"cus_e2e\",…}" },
-  "signal_status": { "signal_id": "01M0SE…", "attempt": 1, "status": "PENDING",
-                     "error_type": "USER_ERROR", "error_code": "INVALID_BODY",
-                     "error_message": "model: must have required property 'model'",
-                     "signal_type": "credit", "…22 null columns…": null, "updated_at": "…" } }
+{ "raw_signals": { "signal_id": "01M0SE…", "organization_id": "", "customer_id": "cus_e2e",
+                   "type": "credit", "idempotency_key": "idem_e2e",
+                   "payload": "{\"customerId\":\"cus_e2e\",…}", "received_at": "…" },
+  "error_code": "INVALID_BODY" }
 ```
 
-The top-level keys are **table names**, so a worker draining the queue does two
-bulk inserts and no transformation:
+`raw_signals` is a table name, so the consumer inserts it directly. `error_code`
+is NOT a `raw_signals` column — it is what the consumer needs to write the
+signal's one `Failed` status event, so the pending consumer is not a pure
+passthrough. This is the accepted path's shape too, minus the `error_code`
+(`AcceptedMessage` is just `{ raw_signals }`).
 
-```js
-insert('raw_signals',   batch.map((m) => m.raw_signals))
-insert('signal_status', batch.map((m) => m.signal_status))
-```
+The message may not grow anything else. What the edge knows that has no column —
+the HTTP status, the api-key digest, AJV's full `issues` list, even the
+`error_message` sentence — is dropped in `vent.service.ts`. The slim
+`signal_status_events` schema keeps only `error_code`; which field failed is no
+longer recorded anywhere (a real loss the schema chose).
 
-That is the whole reason the message may not grow a field. Anything the edge
-knows that has no column — the HTTP status, the api-key digest, AJV's full
-`issues` list — is dropped in `vent.service.ts` rather than smuggled alongside.
-`error_message` therefore holds the **first** problem only, the same sentence
-`statusDetail.message` gave the caller.
-
-Four things here are forced by ClickHouse, not by taste:
+Things forced by ClickHouse, not by taste:
 
 - **`organization_id` is `''` on every reject, never null.** It is a non-Nullable
   `String`, and a JSON `null` into one is an *insert error*, not a default. It is
-  empty rather than absent because every 4xx on the signal route is decided
-  *before* `resolveApiKeyAndBody` returns — the edge never learns whose signal it
-  was. Same for `customer_id` and `api_key_id`. Every `| null` field in
-  `SignalStatusRow` must be declared `Nullable(...)` in the DDL for the same
-  reason, in the other direction.
-- **All 31 status columns are written, most of them null.** A rejected signal was
-  never priced, so there is no money, credit or outcome data. Omitting them would
-  work (JSONEachRow fills defaults) but the message would stop being a record of
-  what the edge did and did not know.
+  empty because every 4xx is decided *before* `resolveApiKeyAndBody` returns — the
+  edge never learns whose signal it was. Same for `customer_id`.
 - **`received_at` is ISO-8601**, which ClickHouse's default
-  `date_time_input_format=basic` *rejects* — the `T` and the `Z`. The worker must
-  insert with `date_time_input_format=best_effort`, or reformat.
-- **`payload` is capped by its ENCODED size, not by `BODY_BYTES`.** A 64KB body
-  is legal, but 64KB of control characters becomes 384KB of `\u00xx` escapes and
-  SQS refuses anything over 256KB — so the send would throw, the vent would fail
-  open, and the row would vanish. Since a body full of control bytes is not
-  valid JSON, that is precisely the `MALFORMED_JSON` reject the raw capture
-  exists to preserve. `serialiseVent` trims the payload to fit instead, iterating
-  by code point so a surrogate pair is never split, and logs `droppedBytes`. The
-  column has no room to record that it was cut, so that log line is the only
-  trace.
-- **Both tables must be `ReplacingMergeTree`.** SQS is at-least-once, and the
-  worker's order is `raw_signals` → `signal_status` → delete. A failure between
-  the two inserts redelivers the batch and re-inserts the first table. The engine
-  is what makes that harmless.
+  `date_time_input_format=basic` *rejects* — the `T` and the `Z`. The consumer
+  inserts with `date_time_input_format=best_effort` ([clickhouse.ts](src/client/clickhouse.ts)).
+- **`payload` is capped by its ENCODED size, not by `BODY_BYTES`.** A 64KB body of
+  control characters becomes 384KB of `\u00xx` escapes and SQS refuses anything
+  over 256KB. `serialiseMessage` trims the payload to fit, iterating by code point
+  so a surrogate pair is never split, and logs `droppedBytes`.
+- **`raw_signals` is `ReplacingMergeTree` keyed on `signal_id`.** SQS is
+  at-least-once, so a redelivered batch re-inserts a row; the engine collapses the
+  duplicate on merge. `signal_status_events` is `ReplacingMergeTree(timestamp)`
+  keyed on `(signal_id, status, attempt)` — a redelivered event collapses, but
+  distinct events (`Processing` then `Processed`) coexist.
 
 Failure posture, and why it is the opposite of the accepted path's:
 
@@ -300,44 +284,55 @@ The publisher sets no per-message delay and does not know the number.
 
 ## The consumers
 
-Two Lambdas drain the two queues into ClickHouse (`src/workers/`), each with the
-topology its queue wants. They are the mirror image of each other:
+Two Lambdas drain the two queues into ClickHouse (`src/workers/`), writing to two
+tables:
 
-| Consumer | Queue | Concurrency | Batching | Writes |
+- **`raw_signals`** — one row per signal, the request as it arrived.
+- **`signal_status_events`** — an append-only event log. A signal's status is the
+  newest event: `argMax(status, timestamp) GROUP BY signal_id`. Three states:
+  **`Processing`**, **`Processed`**, **`Failed`**.
+
+| Consumer | Queue | Concurrency | Batching | Does |
 | --- | --- | --- | --- | --- |
-| `pending.handler` | `signals_pending` | **1** (reserved concurrency) | 60s window | `raw_signals` **then** `signal_status` |
-| `accepted.handler` | `signals_accepted` | **N** (`MaximumConcurrency`, default 5) | none | `raw_signals` + a `batch_id` |
+| `pending.handler` | `signals_pending` | **1** (reserved) | 60s window | writes `raw_signals` + one `Failed` event |
+| `accepted.handler` | `signals_accepted` | **N** (default 5) | ~none (1s) | writes `raw_signals`, a `Processing` event, settles, then `Processed`/`Failed` |
 
-Pending is low-urgency analytics, so one consumer drains a 60s window in big
-batches; accepted is billable, so N consumers clear it as fast as it fills. The
-topology lives in the Terraform ([infra/lambdas.tf](infra/lambdas.tf), sized by
-the variables in [infra/variables.tf](infra/variables.tf)), not the handler code
-— a handler does not know how many of it are running.
+Pending is low-urgency analytics (one consumer, big batches); accepted is
+billable (N consumers, drained fast). Sizing is in [infra/variables.tf](infra/variables.tf).
 
-Things that are load-bearing here:
+**The accepted consumer's settle flow**, per invocation:
+1. write every `raw_signals` row, then a `Processing` event for each
+2. `POST /internal/settle` with `{ batchId, signals }` — the payload parsed back
+   out of `raw_signals.payload` and spread into each signal (settle needs the
+   customer, type and metering fields)
+3. per result: `PROCESSED` → `Processed` event; `PENDING`+`USER_ERROR` → `Failed`
+   event (terminal, ack); `PENDING`+`SERVER_ERROR` → **no event**, report a
+   batch-item-failure so SQS redelivers (`attempt` increments). A settle call
+   that throws sends the whole batch back.
 
-- **The message key is the table name**, so a consumer does
-  `insert(<key>, message[<key>])` and nothing else — no mapping. `pending.handler`
-  inserts `raw_signals` before `signal_status` because the second references the
-  first.
-- **Partial batch failure.** Both return `batchItemFailures` (the mappings set
-  `ReportBatchItemFailures`), so one poison message replays alone, not the whole
-  batch. `insertTagged` isolates it by retrying each row when the bulk insert
-  throws. Safe because both tables are `ReplacingMergeTree` — a re-inserted row
-  collapses on merge.
-- **`batch_id` is stamped by the accepted consumer, once per invocation** — a
-  `Nullable(String)` column, null on every pending row (a signal is accepted or
-  rejected, never both, so they never collide).
-- **ClickHouse must be inserted with `date_time_input_format=best_effort`**
-  ([src/client/clickhouse.ts](src/client/clickhouse.ts)), or the ISO-8601
-  `received_at` is rejected — the default `basic` format refuses the `T` and `Z`.
-- **The Lambda reaches ClickHouse by container name** (`http://clickhouse:8123`),
-  which only works because LocalStack runs the Lambda on the compose network
-  (`LAMBDA_DOCKER_NETWORK` in `docker-compose.yml`). Off that network the
-  consumer cannot resolve `clickhouse` and every insert times out.
-- **The bundle is ESM (`index.mjs`), not CJS.** Bundling the handler to CJS lost
-  the `handler` export under `undici`'s own `module.exports`. See
-  `scripts/lambda/build.mjs`.
+Load-bearing details:
+
+- **Partial batch failure.** Both return `batchItemFailures` (mappings set
+  `ReportBatchItemFailures`), so one poison message replays alone. `insertTagged`
+  isolates a bad row by retrying each alone when the bulk insert throws. Safe
+  because the tables are `ReplacingMergeTree` — a re-insert collapses on merge.
+- **`Processing` is written before settle, the terminal event after**, with a
+  later timestamp, so `argMax(status, timestamp)` resolves to the terminal state.
+  A signal stuck retrying (`SERVER_ERROR`) sits at `Processing` until it resolves.
+- **`attempt` is the SQS receive count** (`ApproximateReceiveCount`), so a
+  redelivery is attempt 2, 3, …. It threads into the status event and the settle
+  call.
+- **`batch_id`** is one UUID per consumer invocation, on every event that
+  invocation writes — traces a row to the run that made it.
+- **ClickHouse insert uses `date_time_input_format=best_effort`**
+  ([clickhouse.ts](src/client/clickhouse.ts)) for the ISO-8601 timestamps.
+- **The Lambda reaches ClickHouse and settle by container name**
+  (`http://clickhouse:8123`, `http://mock-settle:3999`), which works only because
+  LocalStack runs the Lambda on the compose network (`LAMBDA_DOCKER_NETWORK`).
+- **`mock-settle`** (a compose container) stands in for the Vercel payments app's
+  `/internal/settle` locally; the accepted Lambda's `PAYMENTS_URL` points at it.
+- **The bundle is ESM (`index.mjs`), not CJS** — CJS lost the `handler` export
+  under `undici`'s `module.exports`. See `scripts/lambda/build.mjs`.
 
 Provision with `npm run infra:apply` — it bundles the handlers and runs
 `terraform -chdir=infra apply`, which owns the queues, the functions and the

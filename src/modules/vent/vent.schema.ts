@@ -1,131 +1,99 @@
-/** Types for the reject vent. A leaf: imports nothing from the module.
+/** Types for the queue messages and the ClickHouse rows they carry. A leaf:
+ *  imports nothing from the module.
  *
  *  ─────────────────────────────────────────────────────────────────────────────
- *  THESE TWO INTERFACES ARE CLICKHOUSE COLUMNS, NOT A WIRE SHAPE.
+ *  `RawSignalRow` IS the `raw_signals` table, column for column.
  *
- *  Field names are `snake_case` because they are column names, and the whole
- *  point of the message is that a worker can take a batch off the queue and
- *  bulk-insert it with no transformation at all:
+ *  Field names are `snake_case` because they are column names, and the message
+ *  carries the row so a consumer bulk-inserts it with no mapping. So nothing may
+ *  be added that is not a column, and nothing omitted that is one.
  *
- *      insert('raw_signals',   batch.map((m) => m.raw_signals))
- *      insert('signal_status', batch.map((m) => m.signal_status))
- *
- *  So nothing may be added to these interfaces that is not a column, and
- *  nothing may be omitted that is one. Two consequences follow from the DDL
- *  rather than from taste:
- *
- *   · `organization_id`, `customer_id` and `api_key_id` are non-`Nullable`
- *     `String`, and a JSON `null` into a non-Nullable column is an INSERT
- *     ERROR, not a default. They carry `''` when unknown — which, for
- *     `organization_id`, is every single reject: every 4xx on the signal route
- *     is decided before `resolveApiKeyAndBody` returns, so the edge never
- *     learns whose signal it was.
- *   · every `| null` field below must be declared `Nullable(...)` in the DDL
- *     for the same reason, in the other direction.
+ *  `organization_id` and `customer_id` are non-`Nullable` `String`: the edge
+ *  sends `''` when it does not know them (a JSON null into a non-Nullable column
+ *  is an INSERT ERROR). On a reject `organization_id` is ALWAYS `''` — every 4xx
+ *  is decided before the key resolves, so the edge never learns whose it was.
  *  ─────────────────────────────────────────────────────────────────────────── */
 
-/** One row of `raw_signals` — the request as it arrived, whatever became of it. */
+/** One row of `raw_signals`. */
 export interface RawSignalRow {
   /** ULID stamped at the edge; the key that threads everything. */
   signal_id: string
   /** `''` on a reject: unknown until the key resolves, and it never did. */
   organization_id: string
-  /** Read off the payload at the EDGE, not by the worker — the edge already
-   *  parsed the body, and on a reject the worker may get a payload that never
-   *  parsed at all. `''` when the caller sent none. */
+  /** Read off the payload at the edge; `''` when the caller sent none. */
   customer_id: string
-  /** Arrival time at the edge, ISO-8601 UTC. */
-  received_at: string
+  /** What was metered — `wallet` | `credit` | `outcome`; null when the caller
+   *  sent none or something that is not one of the three. */
+  type: string | null
   /** The caller's retry key, if sent. */
   idempotency_key: string | null
-  /** Which `cnk_` key sent it. `''` on a reject — see the note above. */
-  api_key_id: string
   /** The request body, word for word — the RAW bytes, so a body that is not
    *  valid JSON is still recorded verbatim rather than lost. `''` only when the
    *  caller sent no body at all. */
   payload: string
+  /** Arrival time at the edge, ISO-8601 UTC. */
+  received_at: string
 }
 
-/** One row of `signal_status`. Every column the settlement worker would fill is
- *  present and `null`: a rejected signal was never priced, so there are no
- *  money numbers, no credit, no outcome. */
-export interface SignalStatusRow {
+/** The lifecycle states a signal moves through, and the only values that ever
+ *  go in `signal_status_events.status`.
+ *
+ *   Processing  a consumer picked the signal up; not yet resolved.
+ *   Processed   settlement succeeded (accepted signals only).
+ *   Failed      the signal was rejected at the edge, or settlement refused it
+ *               with a terminal (caller's-fault) error.
+ *
+ *  The events are written by the CONSUMERS, not the edge — the edge does not
+ *  know a signal's fate — so this type lives here only because it is the shared
+ *  vocabulary of the pipeline. */
+export type SignalStatus = 'Processing' | 'Processed' | 'Failed'
+
+/** One row of `signal_status_events`. Built by a consumer, never by the edge. */
+export interface StatusEventRow {
   signal_id: string
-  organization_id: string
-  /** Which delivery of this signal this run settled. Always 1 from the edge —
-   *  a reject is a first and only delivery. */
-  attempt: number
-  status: 'PROCESSED' | 'PENDING'
-  /** Who has to act: USER_ERROR needs the caller's data fixed, SERVER_ERROR is
-   *  ours and is safe to retry as-is. Derived from the status code — 4xx is the
-   *  caller's, 5xx is ours. */
-  error_type: 'USER_ERROR' | 'SERVER_ERROR' | null
-  /** The `ErrorReason` union off the wire contract, verbatim, so the column and
-   *  `result.errorReason` share one vocabulary. */
+  /** The consumer invocation that wrote this event. */
+  batch_id: string
+  status: SignalStatus
+  /** Set on `Failed`; null otherwise. The `ErrorReason`/settle code verbatim. */
   error_code: string | null
-  /** The first problem only, the same sentence `statusDetail.message` carried. */
-  error_message: string | null
-  /** What the signal metered, read from the payload — set even on a signal that
-   *  failed; null when the caller sent something that is not one of the three. */
-  signal_type: 'wallet' | 'credit' | 'outcome' | null
-  usage_log_id: string | null
-  credits_used: number | null
-  provided_cost: number | null
-  customer_cost: number | null
-  credit_id: string | null
-  credit_name: string | null
-  model_name: string | null
-  provider: string | null
-  member_name: string | null
-  currency_code: string | null
-  applied_rules: string | null
-  wallet_debit_usd: number | null
-  balance_remaining: number | null
-  outcome_id: string | null
-  outcome_name: string | null
-  outcome_step: string | null
-  outcome_steps_done: number | null
-  outcome_run_id: string | null
-  outcome_closed_run: boolean | null
-  outcome_completed: boolean | null
-  outcome_signal_count: number | null
-  outcome_total_steps: number | null
-  updated_at: string
-}
-
-/** What one SQS message carries. The keys are TABLE NAMES on purpose — a batch
- *  off the queue maps straight onto two inserts. Nothing else belongs at this
- *  level; a field here that is not a table is a field the worker has to know to
- *  skip. */
-export interface VentMessage {
-  raw_signals: RawSignalRow
-  signal_status: SignalStatusRow
+  /** Which delivery of the signal this event belongs to — the SQS receive
+   *  count, so a redelivery is attempt 2, 3, … */
+  attempt: number
+  /** When the event was written; also the ReplacingMergeTree version. */
+  timestamp: string
 }
 
 /**
- * What one `signals_accepted` message carries.
+ * A `signals_pending` message: one rejected signal.
  *
- * Deliberately only the two columns the edge is certain of. The rest of
- * `raw_signals` — organisation, customer, the payload — is known here too, but
- * this pipeline starts minimal: the id and the arrival time are what everything
- * downstream joins on, and `signal_status` is written later in the pipeline,
- * not by the edge.
+ * `raw_signals` is inserted as-is; `error_code` is what the consumer needs to
+ * write the signal's one `Failed` event (a rejected signal is terminal, so it
+ * never enters settlement). `error_code` is NOT a `raw_signals` column, which is
+ * why the pending consumer is not a pure passthrough — it builds a status event.
+ */
+export interface PendingMessage {
+  raw_signals: RawSignalRow
+  /** The `ErrorReason` the edge refused the signal with. */
+  error_code: string
+}
+
+/**
+ * A `signals_accepted` message: one accepted signal.
  *
- * Keyed by table name for the same reason `VentMessage` is: the consumer does
- * `INSERT INTO raw_signals FORMAT JSONEachRow` with the object under that key
- * and nothing else. The omitted non-Nullable columns take their ClickHouse
- * defaults, which is `''` — the same value the pending pipeline sends
- * explicitly.
+ * Carries the FULL `raw_signals` row, because the accepted consumer both inserts
+ * it AND calls `/internal/settle`, and settle needs the customer, the type and
+ * the payload as input. The consumer parses `payload` back into the body fields
+ * settle wants.
  */
 export interface AcceptedMessage {
-  raw_signals: Pick<RawSignalRow, 'signal_id' | 'received_at'>
+  raw_signals: RawSignalRow
 }
 
 /**
- * The slice of SQS the vent needs — deliberately tiny so the service takes a
- * port, not a driver, exactly like `KeyCache` does for Redis. The AWS SDK
- * client satisfies it through the thin wrapper in `plugins/sqs.ts`; a test
- * hands it an array-backed fake.
+ * The slice of SQS the edge needs — deliberately tiny so the service takes a
+ * port, not a driver, exactly like `KeyCache` does for Redis. The AWS SDK client
+ * satisfies it through the thin wrapper in `plugins/sqs.ts`; a test hands it an
+ * array-backed fake.
  */
 export interface SignalQueue {
   send(body: string): Promise<void>

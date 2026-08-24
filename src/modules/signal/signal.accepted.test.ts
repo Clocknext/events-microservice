@@ -94,16 +94,21 @@ test('an accepted signal is published to signals_accepted', async () => {
   assert.equal(result.pending.length, 0, 'and nothing on the reject queue')
 })
 
-test('the message carries only signal_id and received_at', async () => {
+test('the message carries the full raw_signals row', async () => {
   const { accepted } = await postAccepted()
   const message = JSON.parse(accepted[0]!) as Record<string, Record<string, unknown>>
 
-  // Keyed by table name, like the pending message, so the consumer does
-  // `INSERT INTO raw_signals FORMAT JSONEachRow` and nothing else.
+  // Keyed by table name, so the consumer inserts raw_signals directly.
   assert.deepEqual(Object.keys(message), ['raw_signals'])
-  // Only the two columns the edge is certain of. `signal_status` is written
-  // later in the pipeline, not here.
-  assert.deepEqual(Object.keys(message.raw_signals!).sort(), ['received_at', 'signal_id'])
+  // The FULL row — the consumer both inserts it and settles it, and settle needs
+  // the customer, the type and the payload.
+  assert.deepEqual(
+    Object.keys(message.raw_signals!).sort(),
+    ['customer_id', 'idempotency_key', 'organization_id', 'payload', 'received_at', 'signal_id', 'type'],
+  )
+  assert.equal(message.raw_signals!.organization_id, 'org_acme')
+  assert.equal(message.raw_signals!.customer_id, 'cus_abc123')
+  assert.equal(message.raw_signals!.type, 'credit')
 })
 
 test('the id on the queue is the id the caller was given', async () => {

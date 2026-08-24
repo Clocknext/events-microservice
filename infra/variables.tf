@@ -21,6 +21,18 @@ variable "clickhouse_database" {
   default = "signals"
 }
 
+# The accepted consumer calls /internal/settle. Locally that is the mock-settle
+# container on this network; in prod, the Vercel payments app.
+variable "payments_url" {
+  type    = string
+  default = "http://mock-settle:3999"
+}
+
+variable "internal_settle_secret" {
+  type    = string
+  default = "local-dev-secret"
+}
+
 # --- consumer sizing ---------------------------------------------------------
 # accepted: N concurrent consumers, each up to accepted_batch_size signals.
 variable "accepted_batch_size" {

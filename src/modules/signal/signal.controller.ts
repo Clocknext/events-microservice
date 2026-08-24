@@ -31,7 +31,18 @@ export async function postSignal(
   const acceptedQueue = request.server.acceptedQueue
   if (acceptedQueue) {
     try {
-      await publishAccepted(acceptedQueue, buildAcceptedMessage(accepted))
+      await publishAccepted(
+        acceptedQueue,
+        // The full raw_signals row — the accepted consumer both inserts it and
+        // settles it, and settle needs the customer, type and payload. `body`
+        // is the validated, normalised body the caller sent.
+        buildAcceptedMessage({
+          signalId: accepted.signalId,
+          receivedAt: accepted.receivedAt,
+          organizationId: accepted.organizationId,
+          body: request.body,
+        }),
+      )
     } catch (err) {
       throw new BadGatewayError('Could not accept the signal. Retry shortly.', 'QUEUE_UNAVAILABLE', {
         detail: err instanceof Error ? err.message : 'accepted queue publish failed',

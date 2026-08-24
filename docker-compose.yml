@@ -51,6 +51,19 @@ services:
       timeout: 3s
       retries: 12
 
+  # Stands in for the payments app's /api/internal/settle so the accepted
+  # consumer's settle call resolves locally. In prod this is Vercel; the Lambda's
+  # PAYMENTS_URL points here instead (http://mock-settle:3999 on this network).
+  mock-settle:
+    container_name: mock-settle
+    image: node:22-alpine
+    working_dir: /app
+    command: node mock-settle.mjs
+    volumes:
+      - ./scripts/mock-settle.mjs:/app/mock-settle.mjs:ro
+    ports:
+      - "127.0.0.1:3999:3999"
+
 volumes:
   # A named volume rather than a bind mount: the server runs as uid 101 and a
   # host-owned ./volume directory fails with permission errors on first start.

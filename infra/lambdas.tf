@@ -66,9 +66,11 @@ resource "aws_lambda_function" "accepted" {
 
   environment {
     variables = {
-      CLICKHOUSE_URL      = var.clickhouse_url
-      CLICKHOUSE_DATABASE = var.clickhouse_database
-      CLICKHOUSE_USER     = "default"
+      CLICKHOUSE_URL         = var.clickhouse_url
+      CLICKHOUSE_DATABASE    = var.clickhouse_database
+      CLICKHOUSE_USER        = "default"
+      PAYMENTS_URL           = var.payments_url
+      INTERNAL_SETTLE_SECRET = var.internal_settle_secret
     }
   }
 }

@@ -27,7 +27,7 @@ import { StringDecoder } from 'node:string_decoder'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import fp from 'fastify-plugin'
 import { config } from '../config.js'
-import { buildVentMessage, mintSignalId, publishVent } from '../modules/vent/vent.service.js'
+import { buildPendingMessage, mintSignalId, publishPending } from '../modules/vent/vent.service.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -110,7 +110,7 @@ export default fp(
       if (request.vented) return
 
       try {
-        await ventNow(app, request, reply.statusCode)
+        await ventNow(app, request)
       } catch (err) {
         // Fail open, loudly. The response has already gone out and was a
         // truthful rejection; all that is lost is a row, and losing it must not
@@ -136,26 +136,19 @@ export default fp(
  *     propagate: `Processing in the queue.` is a promise, and a signal that
  *     reached no queue and no ClickHouse row would be lost in silence.
  *
- * `statusCode` is the status the request WOULD have been refused with, not the
- * 202 that may go out instead — `error_type` is derived from it, so passing 202
- * here would file every refusal as though nothing had gone wrong.
+ * The pending consumer marks every rejected signal `Failed`, so the message
+ * carries only the `error_code`, not the HTTP status.
  */
-export async function ventNow(
-  app: FastifyInstance,
-  request: FastifyRequest,
-  statusCode: number,
-): Promise<void> {
+export async function ventNow(app: FastifyInstance, request: FastifyRequest): Promise<void> {
   const queue = app.queue
   if (!queue) return
 
-  const droppedBytes = await publishVent(
+  const droppedBytes = await publishPending(
     queue,
-    buildVentMessage({
+    buildPendingMessage({
       signalId: request.signalId,
       receivedAt: request.receivedAt,
-      statusCode,
       errorReason: request.errorReason,
-      errorMessage: request.errorMessage,
       body: request.body,
       rawBody: request.rawBody,
     }),

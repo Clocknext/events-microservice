@@ -4,115 +4,61 @@
 -- /docker-entrypoint-initdb.d once the data directory exists. To re-apply after
 -- editing, drop the volume: `docker compose down -v clickhouse`.
 --
--- The two tables are exactly the two objects a vent message carries, so a
--- worker draining the queue does `INSERT INTO <key> FORMAT JSONEachRow` with
--- the object under that key and no transformation at all.
+-- Two tables:
+--   raw_signals           one row per signal — the request as it arrived.
+--   signal_status_events  an append-only event log — one row per status change
+--                         of a signal (Processing -> Processed | Failed).
 
 CREATE DATABASE IF NOT EXISTS signals;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Every request that reached the edge, whatever became of it.
+-- Every signal that reached the edge, whatever became of it.
 --
--- ReplacingMergeTree is NOT a preference. SQS is at-least-once, and the worker
--- inserts raw_signals, then signal_status, then deletes the message — so a
--- failure between the two inserts redelivers the batch and re-inserts these
--- rows. The engine is what makes that harmless.
+-- ReplacingMergeTree keyed on signal_id: SQS is at-least-once, so a redelivered
+-- batch re-inserts a row — the engine collapses the duplicate on merge. That is
+-- what makes at-least-once delivery safe.
 --
--- organization_id, customer_id and api_key_id are non-Nullable, which is why
--- the edge sends '' rather than null for the ones it does not know: a JSON null
--- into a non-Nullable column is an INSERT ERROR, not a default. On a rejected
--- signal organization_id is ALWAYS '' — the key never resolved.
+-- organization_id and customer_id are non-Nullable, so the edge sends '' (not
+-- null) when it does not know them — a JSON null into a non-Nullable column is
+-- an INSERT ERROR. On a rejected signal organization_id is ALWAYS '': every 4xx
+-- is decided before the key resolves, so the edge never learns whose it was.
 CREATE TABLE IF NOT EXISTS signals.raw_signals
 (
   signal_id        String,                       -- ULID stamped at the edge; the key that threads everything
-  organization_id  String,
-  customer_id      String,                       -- read off the payload at the EDGE (the worker may get a payload that never parsed)
-  received_at      DateTime64(3),                -- arrival time at the edge
-  idempotency_key  Nullable(String),             -- caller's retry key, if sent
-  api_key_id       String,                       -- which cnk_ key sent it
-  payload          String CODEC(ZSTD(3)),        -- the request body, word for word; compressed because it is the only large column
-  batch_id         Nullable(String)              -- the consumer invocation that ingested this row; set by the accepted consumer, null on a pending (rejected) row
+  organization_id  String,                       -- '' on a reject (unknown until the key resolves)
+  customer_id      String,                       -- read off the payload at the edge; '' when absent
+  type             Nullable(String),             -- wallet | credit | outcome; null when the caller sent none/invalid
+  idempotency_key  Nullable(String),             -- the caller's retry key, if sent
+  payload          String CODEC(ZSTD(3)),        -- the request body, word for word; compressed, the only large column
+  received_at      DateTime64(3)                 -- arrival time at the edge
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(received_at)
 ORDER BY (organization_id, received_at, signal_id);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- What became of each signal. One row per signal, not per attempt:
--- ReplacingMergeTree(updated_at) keeps the newest row for a given
--- (organization_id, signal_id), so a retry OVERWRITES its predecessor and the
--- UI reads current state without a GROUP BY.
+-- The lifecycle of each signal, as an append-only event log.
 --
--- If attempt history is ever wanted instead, `attempt` joins the ORDER BY —
--- but that is a table rebuild once rows exist, so it is a decision to make now
--- rather than later.
+-- One signal produces several rows over time — Processing when a consumer picks
+-- it up, then Processed or Failed once it resolves. The current state of a
+-- signal is the row with the newest timestamp:
 --
--- Every column the settlement worker would fill is present and Nullable: a
--- rejected signal was never priced, so it carries nulls in all of them, and the
--- edge writes them out explicitly rather than omitting them.
-CREATE TABLE IF NOT EXISTS signals.signal_status
+--   SELECT argMax(status, timestamp) FROM signal_status_events GROUP BY signal_id
+--
+-- ReplacingMergeTree(timestamp) keyed on (signal_id, status, attempt): a
+-- REDELIVERED event (same signal, same status, same delivery) collapses to one
+-- row, but genuinely distinct events (Processing then Processed, or attempt 1
+-- then attempt 2) coexist. batch_id is deliberately NOT in the sort key — it
+-- changes on every redelivery, so keying on it would defeat the dedup; the
+-- newest timestamp wins and carries the most recent invocation's batch_id.
+CREATE TABLE IF NOT EXISTS signals.signal_status_events
 (
-  signal_id             String,                  -- the raw_signals row this describes
-  organization_id       String,
-  attempt               UInt32,                  -- 1, 2, 3… which delivery of this signal this run settled
-  status                String,                  -- 'PROCESSED' | 'PENDING'
-  -- Who has to act: USER_ERROR needs the caller's data fixed, SERVER_ERROR is
-  -- ours and is safe to retry as-is. Null when settled.
-  error_type            Nullable(String),        -- 'USER_ERROR' | 'SERVER_ERROR'
-  error_code            Nullable(String),        -- the ErrorReason union, verbatim off the wire contract
-  error_message         Nullable(String),        -- the first problem only; there is no issues column
-  -- What the signal metered. Read from the payload, so it is set even on a
-  -- signal that failed; null only when the caller sent something that is not
-  -- one of the three kinds.
-  signal_type           Nullable(String),        -- 'wallet' | 'credit' | 'outcome'
-  -- Points at SignalLog.id in Supabase, which is the truth of record for the
-  -- billing numbers below. These columns are a display copy, which is why
-  -- Float64 is acceptable here and would not be there.
-  usage_log_id          Nullable(String),
-  credits_used          Nullable(Float64),       -- for credit kind
-  provided_cost         Nullable(Float64),
-  customer_cost         Nullable(Float64),
-  -- The credit's id, so the UI can link the row even after a rename — names are
-  -- snapshots and drift; ids don't. Null for wallet / outcome signals.
-  credit_id             Nullable(String),
-  credit_name           Nullable(String),
-  model_name            Nullable(String),
-  provider              Nullable(String),        -- display label of the model's provider ("OpenAI")
-  -- Who consumed it, labelled the way the Signals table does — the customer
-  -- member's own name first, falling back to the workspace user.
-  member_name           Nullable(String),
-  currency_code         Nullable(String),        -- the customer's display currency, the unit customer_cost reads in
-  -- The credit rule that fired, as a JSON array
-  -- [{ruleId, ruleName, mode, marginPercentApplied, creditsApplied}] — at most
-  -- one entry, '[]' when none matched. JSON rather than columns because it is a
-  -- snapshot the UI renders whole.
-  applied_rules         Nullable(String),
-  -- USD actually taken off the wallet. NOT only for signal_type 'wallet' — on a
-  -- wallet-funded plan an ARREAR credit and an ARREAR outcome completion debit
-  -- it too. 0 when untouched; null on a replay.
-  wallet_debit_usd      Nullable(Float64),
-  -- The metered dimension's remaining balance AFTER this signal. Null when the
-  -- meter is uncapped, and on a replay.
-  balance_remaining     Nullable(Float64),
-
-  -- ── outcome attribution ───────────────────────────────────────────────────
-  -- All null unless the signal was tagged with an outcome. Flat rather than
-  -- nested so each one can be its own column.
-  outcome_id            Nullable(String),        -- ids don't drift, names do
-  outcome_name          Nullable(String),        -- the workflow this signal was attributed to
-  outcome_step          Nullable(String),        -- which step of that workflow this signal performed
-  -- That step's position in the catalogue (1-based). An identifier, not
-  -- progress — a step may repeat freely within a run.
-  outcome_steps_done    Nullable(UInt32),
-  outcome_run_id        Nullable(String),        -- the caller's run id; every signal of one workflow shares it
-  outcome_closed_run    Nullable(Bool),          -- this signal carried complete:true and ended the run
-  -- The completion was COUNTED against the allowance. Diverges from
-  -- outcome_closed_run when the run closed with none left.
-  outcome_completed     Nullable(Bool),
-  outcome_signal_count  Nullable(UInt32),        -- how many signals the run holds after this one
-  outcome_total_steps   Nullable(UInt32),        -- catalogue size, not a progress target
-
-  updated_at            DateTime64(3)            -- the version column: newest write wins
+  signal_id   String,                            -- the raw_signals row this is about
+  batch_id    String,                            -- the consumer invocation that wrote this event
+  status      String,                            -- Processing | Processed | Failed
+  error_code  Nullable(String),                  -- set on Failed; null otherwise
+  attempt     UInt32,                            -- which delivery of the signal this event belongs to (SQS receive count)
+  timestamp   DateTime64(3)                      -- when the event was written; also the ReplacingMergeTree version
 )
-ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (organization_id, signal_id);
+ENGINE = ReplacingMergeTree(timestamp)
+ORDER BY (signal_id, status, attempt);

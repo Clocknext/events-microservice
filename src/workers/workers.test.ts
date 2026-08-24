@@ -2,13 +2,14 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { SQSEvent, SQSRecord } from 'aws-lambda'
 import type { ClickHouseClient } from '../client/clickhouse.js'
+import type { StatusEventRow } from '../modules/vent/vent.schema.js'
 import { consumeAccepted } from './accepted.handler.js'
 import { insertTagged, type TaggedRow } from './lib/insert.js'
+import type { SettleResult, SettleSignal } from './lib/settle.js'
 import { consumePending } from './pending.handler.js'
 
-/** A ClickHouse stand-in that records every insert. `failTable` makes one
- *  table's inserts throw, so the partial-failure paths can be exercised without
- *  a real database. `failRows` fails only inserts that contain a matching id. */
+/** A ClickHouse stand-in that records every insert. `failTable` makes a table's
+ *  inserts throw; `failSignalIds` fails only inserts containing a matching id. */
 function fakeClickHouse(opts: { failTable?: string; failSignalIds?: Set<string> } = {}) {
   const inserted: Record<string, object[]> = {}
   const client: ClickHouseClient = {
@@ -26,58 +27,70 @@ function fakeClickHouse(opts: { failTable?: string; failSignalIds?: Set<string> 
   return { client, inserted }
 }
 
-/** Builds an SQSEvent from message bodies, tagging each with a synthetic id. */
-function sqsEvent(bodies: string[]): SQSEvent {
+function events(inserted: Record<string, object[]>): StatusEventRow[] {
+  return (inserted.signal_status_events ?? []) as StatusEventRow[]
+}
+
+/** An SQSEvent from message bodies. `receiveCount` sets ApproximateReceiveCount
+ *  so a test can drive the `attempt`. */
+function sqsEvent(bodies: string[], receiveCountValue = 1): SQSEvent {
   const Records = bodies.map(
-    (body, i) => ({ messageId: `m${i}`, body }) as SQSRecord,
+    (body, i) =>
+      ({
+        messageId: `m${i}`,
+        body,
+        attributes: { ApproximateReceiveCount: String(receiveCountValue) },
+      }) as unknown as SQSRecord,
   )
   return { Records } as SQSEvent
 }
 
-function ventMessage(signalId: string, errorCode = 'INVALID_BODY') {
+function pendingMessage(signalId: string, errorCode = 'INVALID_BODY') {
   return JSON.stringify({
     raw_signals: {
       signal_id: signalId,
       organization_id: '',
       customer_id: 'cus_x',
-      received_at: '2026-08-24T10:00:00.000Z',
+      type: 'credit',
       idempotency_key: null,
-      api_key_id: '',
       payload: '{}',
+      received_at: '2026-08-24T10:00:00.000Z',
     },
-    signal_status: {
+    error_code: errorCode,
+  })
+}
+
+function acceptedMessage(signalId: string, body: object = { customerId: 'cus_x', type: 'credit' }) {
+  return JSON.stringify({
+    raw_signals: {
       signal_id: signalId,
-      organization_id: '',
-      attempt: 1,
-      status: 'PENDING',
-      error_type: 'USER_ERROR',
-      error_code: errorCode,
-      error_message: 'x',
-      signal_type: null,
-      updated_at: '2026-08-24T10:00:00.000Z',
+      organization_id: 'org_x',
+      customer_id: 'cus_x',
+      type: 'credit',
+      idempotency_key: null,
+      payload: JSON.stringify(body),
+      received_at: '2026-08-24T10:00:00.000Z',
     },
   })
 }
 
-function acceptedMessage(signalId: string) {
-  return JSON.stringify({ raw_signals: { signal_id: signalId, received_at: '2026-08-24T10:00:00.000Z' } })
+/** A fake settle that returns a fixed status for every signal it is handed. */
+function fakeSettle(
+  make: (s: SettleSignal) => SettleResult,
+): (batchId: string, signals: SettleSignal[]) => Promise<SettleResult[]> {
+  return async (_batchId, signals) => signals.map(make)
 }
+
+const PROCESSED = (s: SettleSignal): SettleResult => ({
+  signal_id: s.signalId,
+  status: 'PROCESSED',
+  error_type: null,
+  error_code: null,
+})
 
 // --- insertTagged -------------------------------------------------------------
 
-test('insertTagged: a clean batch is one bulk insert, no failures', async () => {
-  const { client, inserted } = fakeClickHouse()
-  const rows: TaggedRow[] = [
-    { messageId: 'a', row: { signal_id: '1' } },
-    { messageId: 'b', row: { signal_id: '2' } },
-  ]
-  const failed = await insertTagged(client, 'raw_signals', rows)
-  assert.equal(failed.size, 0)
-  assert.equal(inserted.raw_signals!.length, 2)
-})
-
 test('insertTagged: one poison row fails alone, the rest still land', async () => {
-  // The bulk insert throws because of row 2; the retry pass isolates it.
   const { client, inserted } = fakeClickHouse({ failSignalIds: new Set(['2']) })
   const rows: TaggedRow[] = [
     { messageId: 'a', row: { signal_id: '1' } },
@@ -85,76 +98,173 @@ test('insertTagged: one poison row fails alone, the rest still land', async () =
     { messageId: 'c', row: { signal_id: '3' } },
   ]
   const failed = await insertTagged(client, 'raw_signals', rows)
-  assert.deepEqual([...failed], ['b'], 'only the poison message is failed')
-  // 1 and 3 land on the per-row retry.
+  assert.deepEqual([...failed], ['b'])
   const ids = inserted.raw_signals!.map((r) => (r as { signal_id: string }).signal_id)
   assert.deepEqual(ids.sort(), ['1', '3'])
 })
 
 // --- pending consumer ---------------------------------------------------------
 
-test('pending: writes raw_signals then signal_status, no failures', async () => {
+test('pending: writes raw_signals and one Failed event carrying the error_code', async () => {
   const { client, inserted } = fakeClickHouse()
-  const res = await consumePending(client, sqsEvent([ventMessage('sig_1'), ventMessage('sig_2')]))
+  const res = await consumePending(client, sqsEvent([pendingMessage('sig_1', 'MALFORMED_JSON')]), 'batch_p')
   assert.deepEqual(res.batchItemFailures, [])
-  assert.equal(inserted.raw_signals!.length, 2)
-  assert.equal(inserted.signal_status!.length, 2)
+  assert.equal(inserted.raw_signals!.length, 1)
+
+  const evs = events(inserted)
+  assert.equal(evs.length, 1)
+  assert.equal(evs[0]!.status, 'Failed')
+  assert.equal(evs[0]!.error_code, 'MALFORMED_JSON')
+  assert.equal(evs[0]!.batch_id, 'batch_p')
+  assert.equal(evs[0]!.attempt, 1)
+})
+
+test('pending: attempt reflects the SQS receive count', async () => {
+  const { client, inserted } = fakeClickHouse()
+  await consumePending(client, sqsEvent([pendingMessage('sig_1')], 3), 'batch_p')
+  assert.equal(events(inserted)[0]!.attempt, 3)
 })
 
 test('pending: an unparseable message is failed, not inserted', async () => {
   const { client, inserted } = fakeClickHouse()
-  const res = await consumePending(client, sqsEvent([ventMessage('sig_1'), '{not json']))
+  const res = await consumePending(client, sqsEvent([pendingMessage('sig_1'), '{bad']), 'batch_p')
   assert.deepEqual(res.batchItemFailures, [{ itemIdentifier: 'm1' }])
-  assert.equal(inserted.raw_signals!.length, 1, 'only the good message is written')
-})
-
-test('pending: a signal_status failure fails that message and skips nothing else', async () => {
-  const { client, inserted } = fakeClickHouse({ failTable: 'signal_status' })
-  const res = await consumePending(client, sqsEvent([ventMessage('sig_1')]))
-  // raw_signals landed, signal_status did not, so the message replays (and both
-  // rows re-insert, which ReplacingMergeTree collapses).
   assert.equal(inserted.raw_signals!.length, 1)
-  assert.deepEqual(res.batchItemFailures, [{ itemIdentifier: 'm0' }])
 })
 
-test('pending: a raw_signals failure does not then insert its signal_status', async () => {
+test('pending: a raw_signals failure writes no orphan event', async () => {
   const { client, inserted } = fakeClickHouse({ failTable: 'raw_signals' })
-  const res = await consumePending(client, sqsEvent([ventMessage('sig_1')]))
+  const res = await consumePending(client, sqsEvent([pendingMessage('sig_1')]), 'batch_p')
   assert.deepEqual(res.batchItemFailures, [{ itemIdentifier: 'm0' }])
-  assert.equal(inserted.signal_status, undefined, 'no orphan status row')
+  assert.equal(inserted.signal_status_events, undefined)
 })
 
-// --- accepted consumer --------------------------------------------------------
+// --- accepted consumer: the settle flow ---------------------------------------
 
-test('accepted: writes raw_signals stamped with the invocation batch id', async () => {
+test('accepted: a settled signal gets raw_signals, Processing, then Processed', async () => {
   const { client, inserted } = fakeClickHouse()
-  const res = await consumeAccepted(
-    client,
-    sqsEvent([acceptedMessage('sig_1'), acceptedMessage('sig_2')]),
-    'batch_abc',
-  )
+  const res = await consumeAccepted(client, fakeSettle(PROCESSED), sqsEvent([acceptedMessage('sig_1')]), 'batch_a')
   assert.deepEqual(res.batchItemFailures, [])
-  assert.equal(inserted.raw_signals!.length, 2)
-  for (const row of inserted.raw_signals!) {
-    assert.equal((row as { batch_id: string }).batch_id, 'batch_abc', 'one id per invocation')
-  }
-})
+  assert.equal(inserted.raw_signals!.length, 1)
 
-test('accepted: only signal_id, received_at and batch_id are written', async () => {
-  const { client, inserted } = fakeClickHouse()
-  await consumeAccepted(client, sqsEvent([acceptedMessage('sig_1')]), 'batch_abc')
+  const evs = events(inserted)
   assert.deepEqual(
-    Object.keys(inserted.raw_signals![0]!).sort(),
-    ['batch_id', 'received_at', 'signal_id'],
+    evs.map((e) => e.status),
+    ['Processing', 'Processed'],
+    'the lifecycle is logged, Processing before Processed',
   )
+  for (const e of evs) assert.equal(e.batch_id, 'batch_a')
 })
 
-test('accepted: a message missing signal_id is failed', async () => {
+test('accepted: Processed is stamped later than Processing, so latest-wins works', async () => {
+  const { client, inserted } = fakeClickHouse()
+  await consumeAccepted(client, fakeSettle(PROCESSED), sqsEvent([acceptedMessage('sig_1')]), 'batch_a')
+  const evs = events(inserted)
+  const processing = evs.find((e) => e.status === 'Processing')!
+  const processed = evs.find((e) => e.status === 'Processed')!
+  assert.ok(processed.timestamp >= processing.timestamp, 'Processed time >= Processing time')
+})
+
+test('accepted: settle is called with the payload spread and the named fields on top', async () => {
   const { client } = fakeClickHouse()
+  let seen: SettleSignal | undefined
+  const settle = async (_b: string, signals: SettleSignal[]) => {
+    seen = signals[0]
+    return signals.map(PROCESSED)
+  }
+  await consumeAccepted(
+    client,
+    settle,
+    sqsEvent([acceptedMessage('sig_1', { customerId: 'cus_x', type: 'credit', model: 'gpt-4o', inputTokens: 5 })]),
+    'batch_a',
+  )
+  assert.equal(seen!.signalId, 'sig_1')
+  assert.equal(seen!.organizationId, 'org_x')
+  assert.equal(seen!.model, 'gpt-4o', 'payload fields pass through to pricing')
+  assert.equal(seen!.inputTokens, 5)
+  assert.equal(seen!.attempt, 1)
+})
+
+test('accepted: a terminal refusal (USER_ERROR) writes Failed and acks', async () => {
+  const { client, inserted } = fakeClickHouse()
+  const settle = fakeSettle((s) => ({
+    signal_id: s.signalId,
+    status: 'PENDING',
+    error_type: 'USER_ERROR',
+    error_code: 'NO_ACTIVE_PLAN',
+  }))
+  const res = await consumeAccepted(client, settle, sqsEvent([acceptedMessage('sig_1')]), 'batch_a')
+  assert.deepEqual(res.batchItemFailures, [], 'terminal: acked, not retried')
+  const evs = events(inserted)
+  assert.deepEqual(evs.map((e) => e.status), ['Processing', 'Failed'])
+  assert.equal(evs.find((e) => e.status === 'Failed')!.error_code, 'NO_ACTIVE_PLAN')
+})
+
+test('accepted: a retryable refusal (SERVER_ERROR) writes no terminal event and redelivers', async () => {
+  const { client, inserted } = fakeClickHouse()
+  const settle = fakeSettle((s) => ({
+    signal_id: s.signalId,
+    status: 'PENDING',
+    error_type: 'SERVER_ERROR',
+    error_code: 'DB_TIMEOUT',
+  }))
+  const res = await consumeAccepted(client, settle, sqsEvent([acceptedMessage('sig_1')]), 'batch_a')
+  assert.deepEqual(res.batchItemFailures, [{ itemIdentifier: 'm0' }], 'sent back to SQS')
+  // Only the Processing event — no terminal, because it is not resolved.
+  assert.deepEqual(events(inserted).map((e) => e.status), ['Processing'])
+})
+
+test('accepted: if settle itself throws, every signal retries', async () => {
+  const { client, inserted } = fakeClickHouse()
+  const settle = async () => {
+    throw new Error('payments unreachable')
+  }
   const res = await consumeAccepted(
     client,
+    settle,
+    sqsEvent([acceptedMessage('sig_1'), acceptedMessage('sig_2')]),
+    'batch_a',
+  )
+  assert.deepEqual(
+    res.batchItemFailures.map((f) => f.itemIdentifier).sort(),
+    ['m0', 'm1'],
+  )
+  // raw + Processing were still written; they replay harmlessly.
+  assert.equal(inserted.raw_signals!.length, 2)
+  assert.deepEqual(events(inserted).map((e) => e.status), ['Processing', 'Processing'])
+})
+
+test('accepted: a mix settles some and retries others in one batch', async () => {
+  const { client, inserted } = fakeClickHouse()
+  const settle = fakeSettle((s) =>
+    s.signalId === 'sig_2'
+      ? { signal_id: s.signalId, status: 'PENDING', error_type: 'SERVER_ERROR', error_code: 'X' }
+      : PROCESSED(s),
+  )
+  const res = await consumeAccepted(
+    client,
+    settle,
+    sqsEvent([acceptedMessage('sig_1'), acceptedMessage('sig_2'), acceptedMessage('sig_3')]),
+    'batch_a',
+  )
+  assert.deepEqual(res.batchItemFailures, [{ itemIdentifier: 'm1' }], 'only sig_2 retries')
+  const processed = events(inserted).filter((e) => e.status === 'Processed').map((e) => e.signal_id)
+  assert.deepEqual(processed.sort(), ['sig_1', 'sig_3'])
+})
+
+test('accepted: a message missing signal_id is failed and never settled', async () => {
+  const { client } = fakeClickHouse()
+  let settleCalled = false
+  const settle = async (_b: string, signals: SettleSignal[]) => {
+    settleCalled = true
+    return signals.map(PROCESSED)
+  }
+  const res = await consumeAccepted(
+    client,
+    settle,
     sqsEvent([JSON.stringify({ raw_signals: { received_at: 'x' } })]),
-    'batch_abc',
+    'batch_a',
   )
   assert.deepEqual(res.batchItemFailures, [{ itemIdentifier: 'm0' }])
+  assert.equal(settleCalled, false, 'nothing valid to settle')
 })

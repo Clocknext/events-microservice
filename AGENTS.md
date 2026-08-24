@@ -25,9 +25,9 @@ root
     │   ├── clickhouse.ts        insert client, used by the workers not the edge
     │   └── types.ts             wire types for the payments endpoints
     ├── workers/                 SQS -> ClickHouse Lambda consumers (not the edge)
-    │   ├── pending.handler.ts   signals_pending  -> raw_signals + signal_status
-    │   ├── accepted.handler.ts  signals_accepted -> raw_signals + batch_id
-    │   └── lib/insert.ts        bulk insert, isolate the poison row on failure
+    │   ├── pending.handler.ts   signals_pending  -> raw_signals + a Failed event
+    │   ├── accepted.handler.ts  signals_accepted -> raw_signals, settle, status events
+    │   └── lib/                  insert (isolate poison rows), settle, receiveCount
     ├── utils/                   framework-agnostic helpers
     │   ├── envelope.ts          the public v1 response envelope + ErrorReason
     │   └── errors.ts            AppError + subclasses, each carrying a reason
@@ -139,11 +139,12 @@ routes through `inject`.
   the client in `onClose`. Services import that decorator, never their own client.
 - `modules/auth/` — resolution + caching are in place; there is no auth *route*
   and no session handling.
-- **Both queue hand-offs are done.** The edge publishes to `signals_pending`
-  (from the vent) and `signals_accepted` (from `signal.controller.ts`, before the
-  202), and two Lambda consumers in `src/workers/` drain both into ClickHouse.
-  See "The consumers" in CLAUDE.md.
-- **`signal_status` for an accepted signal is still unwritten.** The accepted
-  consumer writes only `raw_signals.{signal_id, received_at, batch_id}` — the
-  money and status columns come later in the pipeline (settlement), which does
-  not exist yet.
+- **The full pipeline is wired.** The edge publishes to `signals_pending` (vent)
+  and `signals_accepted` (`signal.controller.ts`, before the 202); two Lambda
+  consumers drain both into ClickHouse; the accepted consumer settles via
+  `/internal/settle` and writes `Processing`/`Processed`/`Failed` events. See "The
+  consumers" in CLAUDE.md.
+- **The money columns are not stored.** `signal_status_events` records only the
+  lifecycle (`status`, `error_code`, `attempt`) — the settle result's credit/cost
+  numbers live in Supabase (`SignalLog`, via `usage_log_id`) and are not copied
+  into ClickHouse here.

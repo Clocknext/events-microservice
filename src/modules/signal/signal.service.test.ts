@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { buildApp } from '../../app.js'
-import type { VentMessage } from '../vent/vent.schema.js'
+import type { PendingMessage } from '../vent/vent.schema.js'
 
 const KEY = 'cnk_7a0a91e402fd2944f79ab8f7ba2f26f678b7acf0c2a08b3a5bea92ed65a811a3'
 
@@ -22,10 +22,10 @@ async function post(
   { raw = false }: { raw?: boolean } = {},
 ) {
   const app = await buildApp()
-  const messages: VentMessage[] = []
+  const messages: PendingMessage[] = []
   app.queue = {
     async send(payload) {
-      messages.push(JSON.parse(payload) as VentMessage)
+      messages.push(JSON.parse(payload) as PendingMessage)
     },
   }
   try {
@@ -78,9 +78,9 @@ function assertRejected(
  * still fires, it is just reported somewhere else.
  */
 function assertQueued(
-  result: { status: number; envelope: unknown; messages: VentMessage[] },
+  result: { status: number; envelope: unknown; messages: PendingMessage[] },
   errorReason: string,
-): VentMessage {
+): PendingMessage {
   const envelope = result.envelope as QueuedEnvelope
   assert.equal(result.status, 202, `expected 202, got ${result.status}`)
   assert.equal(envelope.statusDetail.status, 'SUCCESS')
@@ -90,7 +90,7 @@ function assertQueued(
 
   assert.equal(result.messages.length, 1, 'exactly one message per signal')
   const message = result.messages[0]!
-  assert.equal(message.signal_status.error_code, errorReason)
+  assert.equal(message.error_code, errorReason)
   assert.equal(
     message.raw_signals.signal_id,
     envelope.result.signalId,
@@ -185,17 +185,12 @@ test('a body over the limit is queued as BODY_TOO_LARGE, before validation', asy
 // --- the signal itself was judged and refused --------------------------------
 //
 // The rulebook still fires on every one of these. What changed is where the
-// verdict is reported: `signal_status.error_code` in the queue, not
-// `result.errorReason` on the wire.
+// verdict is reported: `error_code` in the queue message (and later the Failed
+// status event), not `result.errorReason` on the wire. The slim schema keeps
+// only the code — which field failed is no longer recorded anywhere.
 
-test('a refused body names its first broken field in error_message', async () => {
-  const message = assertQueued(
-    await post({ ...VALID, customerId: '  ', inputTokens: -1, outputTokens: '5' }),
-    'INVALID_BODY',
-  )
-  // One column, one problem. AJV found three; the other two are reported
-  // nowhere, which is the cost of `signal_status` having no `issues` column.
-  assert.match(message.signal_status.error_message ?? '', /^customerId: /)
+test('a refused body is queued as INVALID_BODY', async () => {
+  assertQueued(await post({ ...VALID, customerId: '  ', inputTokens: -1, outputTokens: '5' }), 'INVALID_BODY')
 })
 
 test('a whitespace-only id is empty once trimmed, so it is refused', async () => {
@@ -204,10 +199,9 @@ test('a whitespace-only id is empty once trimmed, so it is refused', async () =>
 
 test('token counts are required, and 0 is a valid count', async () => {
   const { inputTokens: _drop, ...missing } = VALID
-  const message = assertQueued(await post(missing), 'INVALID_BODY')
-  assert.match(message.signal_status.error_message ?? '', /^inputTokens: /)
-  // 0 must pass: "send 0 when there are none" is the upstream contract. Getting
-  // as far as the key lookup is what proves the body was accepted.
+  assertQueued(await post(missing), 'INVALID_BODY')
+  // 0 must pass: "send 0 when there are none" is the upstream contract. Reaching
+  // the key lookup (a 502, since payments is unreachable) proves it was accepted.
   assertQueued(await post({ ...VALID, inputTokens: 0, outputTokens: 0 }), 'UPSTREAM_UNAVAILABLE')
 })
 
@@ -224,18 +218,12 @@ test('a negative or fractional token count is refused', async () => {
 
 test('any type requires a model', async () => {
   const { model: _drop, ...noModel } = VALID
-  const message = assertQueued(await post(noModel), 'INVALID_BODY')
-  assert.match(message.signal_status.error_message ?? '', /^model: /)
+  assertQueued(await post(noModel), 'INVALID_BODY')
 })
 
-test('type credit requires an agentKey, and names only agentKey', async () => {
+test('type credit requires an agentKey', async () => {
   const { agentKey: _drop, ...noKey } = VALID
-  const message = assertQueued(await post(noKey), 'INVALID_BODY')
-  assert.match(message.signal_status.error_message ?? '', /^agentKey: /)
-  assert.ok(
-    !(message.signal_status.error_message ?? '').includes('key:'),
-    'never names the deprecated alias',
-  )
+  assertQueued(await post(noKey), 'INVALID_BODY')
 })
 
 test('the deprecated key alias still satisfies the agentKey rule', async () => {
@@ -252,7 +240,7 @@ test('type outcome requires a runId as well', async () => {
 test('type is accepted case-insensitively', async () => {
   // Reaching the key lookup rather than INVALID_BODY proves it was lowercased.
   const message = assertQueued(await post({ ...VALID, type: ' Credit ' }), 'UPSTREAM_UNAVAILABLE')
-  assert.equal(message.signal_status.signal_type, 'credit')
+  assert.equal(message.raw_signals.type, 'credit')
 })
 
 test('an unknown type is refused', async () => {
@@ -277,8 +265,6 @@ test('an oversized custom blob is CUSTOM_TOO_LARGE, not BODY_TOO_LARGE', async (
 test('an unreachable payments app is queued, and leaks nothing', async () => {
   const result = await post(VALID)
   const message = assertQueued(result, 'UPSTREAM_UNAVAILABLE')
-  // Ours, not the caller's — the one place SERVER_ERROR is produced.
-  assert.equal(message.signal_status.error_type, 'SERVER_ERROR')
 
   const onTheWire = JSON.stringify(result.envelope)
   const inTheRow = JSON.stringify(message)

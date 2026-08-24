@@ -103,7 +103,7 @@ async function send(
   request.errorMessage = message
 
   if (shouldDefer(request, result.errorReason)) {
-    return deferToQueue(request, reply, status)
+    return deferToQueue(request, reply)
   }
 
   return reply.status(status).send(
@@ -143,9 +143,9 @@ function shouldDefer(request: FastifyRequest, reason: ErrorReason): boolean {
 /**
  * Answers 202 for a signal that was refused, having first put it on the queue.
  *
- * The ORIGINAL status goes to the queue, not the 202 — `error_type` is derived
- * from it, and filing a broken body as a 202 would record it as though nothing
- * had gone wrong.
+ * The reject's `error_code` is already stashed on the request, so the vent
+ * carries it to `signals_pending` where the consumer writes the signal's
+ * `Failed` event.
  *
  * The publish is awaited, and a failure is re-thrown rather than swallowed.
  * That is the one place this diverges from "only an unset API key is a hard
@@ -153,9 +153,9 @@ function shouldDefer(request: FastifyRequest, reason: ErrorReason): boolean {
  * neither the queue nor ClickHouse would be lost in silence — with the caller
  * told it was safe.
  */
-async function deferToQueue(request: FastifyRequest, reply: FastifyReply, status: number) {
+async function deferToQueue(request: FastifyRequest, reply: FastifyReply) {
   try {
-    await ventNow(request.server, request, status)
+    await ventNow(request.server, request)
   } catch (err) {
     // Answered directly rather than through `send()`, which would route back
     // into shouldDefer and try to queue this failure too.
