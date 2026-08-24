@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# LocalStack's runtime state, recreated on every container start. Holds the
+# generated root CA and server private keys, and the license file.
+volume/
