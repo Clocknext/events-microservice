@@ -1,18 +1,16 @@
-// Load generator for the signal edge. Fires a mix of realistic accepted signals
-// and rejects at a chosen concurrency, and reports throughput + latency.
+// Load generator for the signal edge. Fires a mix of valid signals and rejects
+// at a chosen concurrency, and reports throughput + latency + status codes.
 //
-//   TOTAL=3000 CONCURRENCY=64 REJECT_RATIO=0.2 node scripts/loadtest.mjs
+//   TOTAL=20000 CONCURRENCY=100 REJECT_RATIO=0.2 node scripts/loadtest.mjs
 //
-// It measures the EDGE (real Fastify on the host). The consumers behind SQS are
-// LocalStack Lambda — drain them and check ClickHouse separately; their timing
-// is not a prod proxy.
+// Measures the EDGE (real Fastify on the host). Uses Node's built-in fetch, no
+// dependencies. ClickHouse ingestion is separate — check signals.signal_log.
 import { performance } from 'node:perf_hooks'
-import { Pool } from 'undici'
 
-const EDGE = process.env.EDGE_URL ?? 'http://localhost:3122'
+const EDGE = process.env.EDGE_URL ?? 'http://localhost:3000'
 const KEY = process.env.LOAD_KEY ?? 'cnk_load'
-const TOTAL = Number.parseInt(process.env.TOTAL ?? '3000', 10)
-const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY ?? '64', 10)
+const TOTAL = Number.parseInt(process.env.TOTAL ?? '20000', 10)
+const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY ?? '100', 10)
 const REJECT_RATIO = Number.parseFloat(process.env.REJECT_RATIO ?? '0.2')
 
 // --- prod-like variety --------------------------------------------------------
@@ -46,69 +44,56 @@ function validSignal() {
   if (type === 'outcome') {
     body.agentKey = pick(AGENT_KEYS)
     body.runId = `run_${int(1, 5000)}`
-    if (Math.random() < 0.2) body.complete = true
   }
   if (Math.random() < 0.4) body.idempotencyKey = `idem_${int(1, 1_000_000)}`
   if (Math.random() < 0.2) body.custom = { feature: pick(['chat', 'voice', 'search']), region: 'eu' }
   return body
 }
 
-/** A body that fails validation a different way each time. */
+/** A body missing one of the three required gate fields — a 400 each time. */
 function rejectSignal() {
   const variants = [
     () => ({ type: 'credit', model: 'm', inputTokens: 1, outputTokens: 1 }), // no customerId
-    () => ({ customerId: pick(CUSTOMERS), type: 'credit', inputTokens: 1, outputTokens: 1 }), // no model
-    () => ({ customerId: pick(CUSTOMERS), type: 'credit', model: 'm', inputTokens: 1 }), // no outputTokens
-    () => ({ customerId: pick(CUSTOMERS), type: 'credit', model: 'm', inputTokens: '5', outputTokens: 1 }), // string
-    () => ({ customerId: pick(CUSTOMERS), type: 'outcome', model: 'm', agentKey: 'k', inputTokens: 1, outputTokens: 1 }), // no runId
-    () => ({ customerId: pick(CUSTOMERS), type: 'unit', model: 'm', inputTokens: 1, outputTokens: 1 }), // bad type
+    () => ({ customerId: pick(CUSTOMERS), inputTokens: 1 }), // no outputTokens
+    () => ({ customerId: pick(CUSTOMERS), inputTokens: '5', outputTokens: 1 }), // token as string
+    () => ({ customerId: '   ', inputTokens: 1, outputTokens: 1 }), // blank customerId
   ]
   return pick(variants)()
 }
 
 // --- fire ---------------------------------------------------------------------
-const pool = new Pool(EDGE, { connections: CONCURRENCY, pipelining: 1 })
 const headers = { 'content-type': 'application/json', authorization: `Bearer ${KEY}` }
-
 const latencies = new Float64Array(TOTAL)
-const stat = { accepted: 0, deferred: 0, other: 0, error: 0 }
 const codes = new Map()
-
 let next = 0
+
 async function worker() {
   while (true) {
     const i = next++
     if (i >= TOTAL) break
-    const isReject = Math.random() < REJECT_RATIO
-    const body = isReject ? rejectSignal() : validSignal()
+    const body = Math.random() < REJECT_RATIO ? rejectSignal() : validSignal()
     const t0 = performance.now()
     try {
-      const res = await pool.request({
-        path: '/api/v1/signal',
+      const res = await fetch(`${EDGE}/api/v1/signal`, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
       })
+      await res.arrayBuffer() // drain
       latencies[i] = performance.now() - t0
-      codes.set(res.statusCode, (codes.get(res.statusCode) ?? 0) + 1)
-      const json = await res.body.json().catch(() => ({}))
-      const result = json.result ?? {}
-      if (result.accepted === true) stat.accepted++
-      else if (result.status === 'PENDING') stat.deferred++
-      else stat.other++
+      codes.set(res.status, (codes.get(res.status) ?? 0) + 1)
     } catch {
       latencies[i] = performance.now() - t0
-      stat.error++
+      codes.set('error', (codes.get('error') ?? 0) + 1)
     }
   }
 }
 
-const pct = (sortedMs, p) => sortedMs[Math.min(sortedMs.length - 1, Math.floor((p / 100) * sortedMs.length))]
+const pct = (s, p) => s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))]
 
 const startedAt = performance.now()
 await Promise.all(Array.from({ length: CONCURRENCY }, worker))
 const wallSec = (performance.now() - startedAt) / 1000
-await pool.close()
 
 const sorted = Array.from(latencies).sort((a, b) => a - b)
 console.log(`\n=== load: ${TOTAL} signals @ ${CONCURRENCY} concurrent, ${REJECT_RATIO * 100}% rejects ===`)
@@ -116,4 +101,4 @@ console.log(`wall:        ${wallSec.toFixed(2)}s`)
 console.log(`throughput:  ${(TOTAL / wallSec).toFixed(0)} req/s`)
 console.log(`latency ms:  p50 ${pct(sorted, 50).toFixed(1)}  p95 ${pct(sorted, 95).toFixed(1)}  p99 ${pct(sorted, 99).toFixed(1)}  max ${sorted.at(-1).toFixed(1)}`)
 console.log(`status:      ${[...codes.entries()].map(([c, n]) => `${c}:${n}`).join('  ')}`)
-console.log(`classified:  accepted ${stat.accepted}  deferred(reject) ${stat.deferred}  other ${stat.other}  error ${stat.error}`)
+console.log(`accepted(202): ${codes.get(202) ?? 0}`)

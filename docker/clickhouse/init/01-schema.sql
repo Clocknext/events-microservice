@@ -1,64 +1,73 @@
--- Schema for the signal pipeline's ClickHouse.
+-- Schema for the signal log's ClickHouse.
 --
 -- Run by the container's entrypoint on FIRST START ONLY — ClickHouse ignores
 -- /docker-entrypoint-initdb.d once the data directory exists. To re-apply after
--- editing, drop the volume: `docker compose down -v clickhouse`.
+-- editing, drop the volume: `docker compose down -v`. On a live cluster this is
+-- an ALTER instead — see docs/PRODUCTION.md.
 --
--- Two tables:
---   raw_signals           one row per signal — the request as it arrived.
---   signal_status_events  an append-only event log — one row per status change
---                         of a signal (Processing -> Processed | Failed).
+-- ClickHouse ingests from Kafka ITSELF — there is no consumer/worker process.
+-- Three objects:
+--   kafka_signals   an ENGINE = Kafka stream over the `signals` topic
+--   signal_log      the durable log (ReplacingMergeTree)
+--   signal_log_mv   a materialized view moving messages from the stream to the log
 
 CREATE DATABASE IF NOT EXISTS signals;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Every signal that reached the edge, whatever became of it.
+-- The durable signal log: one row per signal, the body as it arrived.
 --
--- ReplacingMergeTree keyed on signal_id: SQS is at-least-once, so a redelivered
--- batch re-inserts a row — the engine collapses the duplicate on merge. That is
--- what makes at-least-once delivery safe.
---
--- organization_id and customer_id are non-Nullable, so the edge sends '' (not
--- null) when it does not know them — a JSON null into a non-Nullable column is
--- an INSERT ERROR. On a rejected signal organization_id is ALWAYS '': every 4xx
--- is decided before the key resolves, so the edge never learns whose it was.
-CREATE TABLE IF NOT EXISTS signals.raw_signals
+-- ReplacingMergeTree keyed on the ORDER BY tuple makes Kafka's at-least-once
+-- delivery safe: the Kafka engine can redeliver a message (e.g. on a ClickHouse
+-- restart before offsets commit), and the re-inserted row — identical values —
+-- collapses on merge. This is billing data, so money reads use `FINAL` or
+-- `count(DISTINCT signal_id)` to never count a not-yet-merged duplicate twice.
+CREATE TABLE IF NOT EXISTS signals.signal_log
 (
-  signal_id        String,                       -- ULID stamped at the edge; the key that threads everything
-  organization_id  String,                       -- '' on a reject (unknown until the key resolves)
-  customer_id      String,                       -- read off the payload at the edge; '' when absent
-  type             Nullable(String),             -- wallet | credit | outcome; null when the caller sent none/invalid
-  idempotency_key  Nullable(String),             -- the caller's retry key, if sent
-  payload          String CODEC(ZSTD(3)),        -- the request body, word for word; compressed, the only large column
-  received_at      DateTime64(3)                 -- arrival time at the edge
+  signal_id    String,                         -- ULID from the edge; unique per request (envelope)
+  received_at  DateTime64(3),                  -- edge arrival time (envelope)
+  api_key_hash String,                         -- SHA-256 of the caller's key (envelope), NEVER the key
+  payload      String CODEC(ZSTD(3)),          -- the full body as sent, serialized verbatim
+  ingested_at  DateTime64(3) DEFAULT now64(3)  -- when ClickHouse wrote it (ops/lag; not in the body)
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(received_at)
-ORDER BY (organization_id, received_at, signal_id);
+ORDER BY (received_at, signal_id);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- The lifecycle of each signal, as an append-only event log.
+-- The Kafka source stream. Reading it consumes messages, so it is never queried
+-- directly — the materialized view below is what drains it.
 --
--- One signal produces several rows over time — Processing when a consumer picks
--- it up, then Processed or Failed once it resolves. The current state of a
--- signal is the row with the newest timestamp:
---
---   SELECT argMax(status, timestamp) FROM signal_status_events GROUP BY signal_id
---
--- ReplacingMergeTree(timestamp) keyed on (signal_id, status, attempt): a
--- REDELIVERED event (same signal, same status, same delivery) collapses to one
--- row, but genuinely distinct events (Processing then Processed, or attempt 1
--- then attempt 2) coexist. batch_id is deliberately NOT in the sort key — it
--- changes on every redelivery, so keying on it would defeat the dedup; the
--- newest timestamp wins and carries the most recent invocation's batch_id.
-CREATE TABLE IF NOT EXISTS signals.signal_status_events
+-- `JSONAsString` puts each whole message (one JSON object) into the single `raw`
+-- column, nesting intact — no per-field mapping, and the body sub-object survives
+-- untouched. The broker is the compose-INTERNAL listener `kafka:29092`; the
+-- host's `localhost:9092` is not reachable from inside this container.
+CREATE TABLE IF NOT EXISTS signals.kafka_signals
 (
-  signal_id   String,                            -- the raw_signals row this is about
-  batch_id    String,                            -- the consumer invocation that wrote this event
-  status      String,                            -- Processing | Processed | Failed
-  error_code  Nullable(String),                  -- set on Failed; null otherwise
-  attempt     UInt32,                            -- which delivery of the signal this event belongs to (SQS receive count)
-  timestamp   DateTime64(3)                      -- when the event was written; also the ReplacingMergeTree version
+  raw String
 )
-ENGINE = ReplacingMergeTree(timestamp)
-ORDER BY (signal_id, status, attempt);
+ENGINE = Kafka
+SETTINGS
+  kafka_broker_list   = 'kafka:29092',
+  kafka_topic_list    = 'signals',
+  kafka_group_name    = 'clickhouse-signal-log',
+  kafka_format        = 'JSONAsString',
+  kafka_num_consumers = 1;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Moves each message into the log: lift the three envelope fields, keep the body
+-- verbatim. `JSONExtractRaw(raw,'body')` returns the body sub-object as its exact
+-- JSON text — that is the payload. The Kafka engine commits offsets only after
+-- this insert lands, which is what makes the pipeline at-least-once (no loss).
+--
+-- `api_key_hash` is lifted into its own column rather than left in the payload
+-- because it is OURS, not the caller's: `payload` must stay byte-for-byte what
+-- was sent. The dispatcher reads this column and forwards it to
+-- `/api/internal/settle`, which resolves the signal's organisation from it —
+-- `ApiKey.hashedKey` stores the very same digest.
+CREATE MATERIALIZED VIEW IF NOT EXISTS signals.signal_log_mv TO signals.signal_log AS
+SELECT
+  JSONExtractString(raw, 'signalId')                             AS signal_id,
+  parseDateTime64BestEffort(JSONExtractString(raw, 'receivedAt')) AS received_at,
+  JSONExtractString(raw, 'apiKeyHash')                           AS api_key_hash,
+  JSONExtractRaw(raw, 'body')                                    AS payload
+FROM signals.kafka_signals;

@@ -4,9 +4,8 @@ import { healthModule } from './modules/health/health.module.js'
 import { signalModule } from './modules/signal/signal.module.js'
 import corePlugins from './plugins/core.js'
 import errorHandler from './plugins/error-handler.js'
-import redis from './plugins/redis.js'
-import sqs from './plugins/sqs.js'
-import vent from './plugins/vent.js'
+import identity from './plugins/identity.js'
+import kafka from './plugins/kafka.js'
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -38,12 +37,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   // Plugins first — modules registered below depend on them.
   await app.register(corePlugins)
   await app.register(errorHandler)
-  await app.register(redis)
-  await app.register(sqs)
-  // After the error handler on purpose: the vent reads what that plugin decided
-  // about a failure, and before the modules, so its onRequest hook has minted an
-  // id before any route can start failing.
-  await app.register(vent)
+  await app.register(kafka)
+  // Before the modules, so its onRequest hook has minted an id before any route
+  // can start failing — every response, answered or refused, leaves with one.
+  await app.register(identity)
 
   // One register() per module. Each module owns its own prefix.
   await app.register(healthModule)

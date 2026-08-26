@@ -1,31 +1,51 @@
 services:
-  localstack:
-    container_name: "${LOCALSTACK_DOCKER_NAME:-localstack-main}"
-    image: localstack/localstack
+  # Local stand-in for AWS MSK Serverless. Single-broker KRaft (no Zookeeper),
+  # PLAINTEXT. Two advertised listeners:
+  #   PLAINTEXT  localhost:9092  — the edge (`npm run dev`, on the host)
+  #   INTERNAL   kafka:29092     — the ClickHouse container (Kafka table engine),
+  #                                which cannot reach the host's localhost.
+  # Auto-topic-create is on with a single partition, so `signals` springs into
+  # being on first produce/consume. In prod this is MSK Serverless and the edge
+  # authenticates with IAM (KAFKA_USE_IAM=true) — see docs/PRODUCTION.md.
+  kafka:
+    container_name: kafka
+    image: apache/kafka:3.9.0
     ports:
-      - "127.0.0.1:4566:4566" # LocalStack Gateway
-      - "127.0.0.1:4510-4559:4510-4559" # external services port range
+      - "127.0.0.1:9092:9092"
     environment:
-      # Activate LocalStack for AWS: https://docs.localstack.cloud/getting-started/auth-token/
-      - LOCALSTACK_AUTH_TOKEN=ls-nuqU6334-nEko-yuqu-jEHE-LeRU68222120 # required for Pro
-      # LocalStack configuration: https://docs.localstack.cloud/references/configuration/
-      - DEBUG=${DEBUG:-0}
-      # Run Lambda containers ON this compose network, so a consumer can reach
-      # ClickHouse by its container name (http://clickhouse:8123). Without it the
-      # Lambda runs on a default bridge and cannot resolve `clickhouse`.
-      - LAMBDA_DOCKER_NETWORK=${LAMBDA_DOCKER_NETWORK:-aws-internal_default}
-    volumes:
-      - "${LOCALSTACK_VOLUME_DIR:-./volume}:/var/lib/localstack"
-      - "/var/run/docker.sock:/var/run/docker.sock"
-      # Queues and Lambdas are NOT created here anymore — Terraform (infra/) owns
-      # them. `docker compose up` gives you an empty LocalStack; `terraform apply`
-      # provisions the queues, the consumers and their event-source mappings.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # One partition — signals go to the topic as-is, one ordered stream.
+      KAFKA_NUM_PARTITIONS: 1
+      # Single broker: everything replicates once.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
+  # ClickHouse ingests from Kafka itself (Kafka table engine + materialized view,
+  # see docker/clickhouse/init) — there is no consumer process. It reaches the
+  # broker over the compose network at kafka:29092.
   clickhouse:
     container_name: clickhouse
     image: clickhouse/clickhouse-server:25.3
+    depends_on:
+      kafka:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:8123:8123" # HTTP — what the client and `curl` use
+      - "127.0.0.1:8123:8123" # HTTP — what `curl` uses
       - "127.0.0.1:9000:9000" # native protocol — clickhouse-client
     environment:
       - CLICKHOUSE_DB=signals
@@ -51,20 +71,5 @@ services:
       timeout: 3s
       retries: 12
 
-  # Stands in for the payments app's /api/internal/settle so the accepted
-  # consumer's settle call resolves locally. In prod this is Vercel; the Lambda's
-  # PAYMENTS_URL points here instead (http://mock-settle:3999 on this network).
-  mock-settle:
-    container_name: mock-settle
-    image: node:22-alpine
-    working_dir: /app
-    command: node mock-settle.mjs
-    volumes:
-      - ./scripts/mock-settle.mjs:/app/mock-settle.mjs:ro
-    ports:
-      - "127.0.0.1:3999:3999"
-
 volumes:
-  # A named volume rather than a bind mount: the server runs as uid 101 and a
-  # host-owned ./volume directory fails with permission errors on first start.
   clickhouse-data:

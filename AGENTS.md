@@ -1,43 +1,62 @@
 # AGENTS.md
 
-Fastify 5 + TypeScript service. This file is the architecture contract — follow it
-for every new feature. TypeScript, so files are `.ts`, not `.js`.
+Fastify 5 + TypeScript. This file is the architecture contract — the layout and
+the layering rules. Follow it for every new feature. TypeScript, so files are
+`.ts`, not `.js`.
+
+For what the pipeline *does* — the signal path, the archive, the dispatcher, the
+wire contract, and every outcome a signal can have — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), then
+[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md). This file is about where code
+goes, not what it means.
+
+## Two processes, one codebase
+
+| | Entry point | What it is |
+| --- | --- | --- |
+| **the edge** | `src/server.ts` | a Fastify service. `POST /api/v1/signal` — gate, stamp, produce to Kafka, 202 |
+| **the dispatcher** | `src/workers/dispatch/dispatch.runner.ts` | a long-lived loop. Reads the ClickHouse archive, posts batches to the payments app |
+
+They share `config.ts` and nothing else. The dispatcher imports **no plugin and
+no Fastify**; the edge imports **nothing under `client/`**. Keep it that way — the
+moment the edge opens a ClickHouse connection, or the dispatcher reaches for
+`app.*`, the split stops being real.
 
 ## File structure
 
 ```
 root
-├── prisma/
-│   ├── schema.prisma            data model
-│   └── migrations/              generated, committed
+├── docker/clickhouse/
+│   ├── init/                    first-start-only schema (new databases)
+│   └── migrations/              the same changes for a database with rows
+├── docs/                        ARCHITECTURE · IMPLEMENTATION · FINDINGS · PRODUCTION
+├── scripts/
+│   ├── up.sh                    one-shot local setup (npm run up)
+│   ├── loadtest.mjs
+│   └── e2e.mts + e2e/           end-to-end run, harness, fixtures, the two traces
 └── src/
     ├── server.ts                listen + graceful shutdown. Nothing else.
     ├── app.ts                   buildApp(): registers plugins, then modules
     ├── config.ts                env parsing, validated once at boot
     ├── plugins/                 app-wide concerns, wrapped in fastify-plugin
     │   ├── core.ts              sensible, cors
-    │   ├── error-handler.ts     AppError -> HTTP response
-    │   ├── redis.ts             decorates app.cache (KeyCache | null)
-    │   ├── sqs.ts               decorates app.queue (SignalQueue | null)
-    │   └── vent.ts              stamps every request; publishes every 4xx/5xx
-    ├── client/                  outbound HTTP
-    │   ├── payments-client.ts   /api/internal/resolve, /api/internal/settle
-    │   ├── clickhouse.ts        insert client, used by the workers not the edge
-    │   └── types.ts             wire types for the payments endpoints
-    ├── workers/                 SQS -> ClickHouse Lambda consumers (not the edge)
-    │   ├── pending.handler.ts   signals_pending  -> raw_signals + a Failed event
-    │   ├── accepted.handler.ts  signals_accepted -> raw_signals, settle, status events
-    │   └── lib/                  insert (isolate poison rows), settle, receiveCount
+    │   ├── error-handler.ts     AppError -> the v1 envelope
+    │   ├── identity.ts          stamps signalId + receivedAt at onRequest
+    │   └── kafka.ts             decorates app.producer (SignalProducer | null)
+    ├── client/                  outbound HTTP — DISPATCHER ONLY, never the edge
+    │   ├── clickhouse.ts        read-only reader (HTTP + JSONEachRow)
+    │   └── payments-client.ts   cursor / known / settle
+    ├── workers/dispatch/        the dispatcher process
+    │   ├── dispatch.schema.ts   ports + row types (a leaf)
+    │   ├── dispatch.service.ts  sweepOnce() — a pure function over the ports
+    │   ├── dispatch.archive.ts  the two SELECTs against signal_log
+    │   └── dispatch.runner.ts   the self-pacing loop + entry point
     ├── utils/                   framework-agnostic helpers
-    │   ├── envelope.ts          the public v1 response envelope + ErrorReason
+    │   ├── envelope.ts          the public v1 envelope + the ErrorReason union
     │   └── errors.ts            AppError + subclasses, each carrying a reason
     └── modules/
-        ├── auth/                support module — no routes, so only two files
-        │   ├── auth.service.ts  api-key resolution + the Redis caches
-        │   └── auth.schema.ts   ResolvedApiKey, KeyResolution, KeyCache port
-        ├── vent/                support module — the reject queue's payload
-        │   ├── vent.service.ts  builds the two ClickHouse rows; publishes them
-        │   └── vent.schema.ts   RawSignalRow, SignalStatusRow, SignalQueue port
+        ├── auth/                support module — no routes, so one file
+        │   └── auth.service.ts  extractBearer + digestApiKey
         ├── signal/              POST /api/v1/signal
         │   ├── signal.module.ts
         │   ├── signal.routes.ts
@@ -52,20 +71,12 @@ root
             └── health.schema.ts
 ```
 
-A module with no HTTP surface (`auth/`, `vent/`) carries only the files it needs.
-The five-file shape is the rule for a module that owns routes; it is not a quota.
+A module with no HTTP surface (`auth/`) carries only the files it needs. The
+five-file shape is the rule for a module that owns routes; it is not a quota.
 
-`vent/` is a module rather than a util because it owns a contract — two
-ClickHouse row shapes and a queue port. Its *adapter* is a plugin (`vent.ts`)
-because the rule it implements is app-wide: everything that is not an accepted
-signal, including 404s no module owns. A hook, not a controller, is its caller.
-
-`workers/` is NOT part of the Fastify app — it is the other side of the queue.
-A worker is a Lambda `handler(event)`, provisioned by the Terraform in `infra/`
-and bundled by `scripts/lambda/build.mjs`, sharing only `config.ts`, the
-ClickHouse client and the `vent.schema` row types with the edge. It imports no
-plugin and no Fastify. Keep the handler thin over a pure `consume(client, event)`
-so it stays testable without a live database — see CLAUDE.md "The consumers".
+`workers/` is **not** part of the Fastify app. `dispatch.runner.ts` is its own
+entry point, run under a supervisor next to the edge. It shares `config.ts` and
+the two clients, and imports no plugin.
 
 ## The five files in a module
 
@@ -74,39 +85,55 @@ sixth only for a genuinely new role (e.g. `auth.repository.ts`).
 
 | File | Responsibility | Must not |
 | --- | --- | --- |
-| `*.module.ts` | Entry point. Owns the URL prefix, registers routes and module-scoped plugins. | Contain logic |
+| `*.module.ts` | Entry point. Owns the URL prefix, registers routes and module-scoped plugins. | Contain business logic |
 | `*.routes.ts` | Binds method + path + schema + controller handler. | Contain logic |
-| `*.controller.ts` | HTTP adapter: reads `request`, returns a payload. | Contain business rules or touch the DB |
-| `*.service.ts` | Business logic and data access. Plain functions over plain values. | Import `FastifyRequest`/`FastifyReply` or reference HTTP at all |
-| `*.service.ts` deps | Infrastructure a service needs (Redis, later Prisma) arrives as a **function argument**, typed as a narrow port the module declares in its own `*.schema.ts` — see `KeyCache`. | Import a driver or reach for `app.*` itself |
+| `*.controller.ts` | HTTP adapter: reads `request`, returns a payload. | Contain business rules or reach a driver |
+| `*.service.ts` | Business logic. Plain functions over plain values. | Import `FastifyRequest`/`FastifyReply` or reference HTTP at all |
+| `*.service.ts` deps | Infrastructure a service needs arrives as a **function argument**, typed as a narrow port the module declares in its own `*.schema.ts`. | Import a driver or reach for `app.*` itself |
 | `*.schema.ts` | JSON schemas for validation/serialization + the TS types routes are generic over. | Import from the other four |
 
 Dependency direction is one-way: `module → routes → controller → service`.
 `schema` is a leaf everyone may import. A service never imports upward.
 
+**The dispatcher follows the same shape** under different names:
+`dispatch.schema.ts` declares the ports (`ArchiveReader`, `SettleClient`),
+`dispatch.service.ts` is a pure function over them, `dispatch.archive.ts` and
+`client/` are the adapters, and `dispatch.runner.ts` binds them. That is why
+`sweepOnce` is tested with fakes and no infrastructure.
+
 ## Rules
 
 - **ESM.** Relative imports carry the `.js` extension (`./health.service.js`),
-  even though the source is `.ts`. This is required by `module: nodenext`.
+  even though the source is `.ts`. Required by `module: nodenext`. In
+  `scripts/`, `.mts` files import each other as `.mjs`.
 - **Register a module in one place**: one `app.register(xModule)` line in
   [src/app.ts](src/app.ts). Plugins first, modules after.
 - **Prefix belongs to the module**, set in `*.module.ts`. Routes use paths
-  relative to it (`'/'`, `'/echo'`), never a hardcoded full path.
+  relative to it (`'/'`, `'/signal'`), never a hardcoded full path.
 - **Validate at the edge.** Every route with input declares a body/params/query
   schema, and the route is generic over the matching type
-  (`app.post<{ Body: EchoBody }>`). No manual input checking in controllers.
+  (`app.post<{ Body: SignalBody }>`). No manual input checking in controllers.
 - **Add a response schema** for each status you return — it is the serializer,
-  so it also stops accidental field leaks.
+  so it also stops accidental field leaks. It is why the api-key digest cannot
+  escape in a 202 even if someone adds it to the result object.
 - **Errors**: services throw `AppError` subclasses from
   [src/utils/errors.ts](src/utils/errors.ts). Controllers do not catch them;
   [src/plugins/error-handler.ts](src/plugins/error-handler.ts) maps them to
   responses. Never build an error response by hand in a controller.
+- **`ErrorReason` is a wire contract.** A caller may branch on it, so renaming a
+  member is a breaking change. Add, don't rename — and don't delete a dormant
+  one. See the reserved table in CLAUDE.md.
 - **Nothing app-wide in a module.** Cross-cutting behavior goes in `src/plugins/`
   and must be wrapped in `fastify-plugin` so it escapes encapsulation.
 - **`utils/` stays framework-agnostic.** If it imports `fastify`, it is a plugin,
   not a util.
 - **Config only from [src/config.ts](src/config.ts).** No `process.env` reads
-  anywhere else.
+  anywhere else. Nothing loads a `.env` file — pass vars via the environment.
+- **`client/` is the dispatcher's.** The edge must not import from it. The edge's
+  only outbound dependency is Kafka, via `plugins/kafka.ts`.
+- **`signal_log` is read-only to this codebase.** It has exactly one writer, the
+  ClickHouse materialized view. A second writer would put rows in the archive
+  that replaying the topic could not reproduce.
 
 ## Adding a module
 
@@ -119,32 +146,44 @@ Dependency direction is one-way: `module → routes → controller → service`.
 
 | Command | What it does |
 | --- | --- |
-| `npm run dev` | `tsx watch` — reload on save, pretty logs |
-| `npm run typecheck` | Type-check, no emit |
-| `npm run build` | `src/` → `dist/` |
-| `npm start` | Run compiled `dist/server.js` |
-| `npm test` | `node --test` |
+| `npm run up` | sets up `.env`, containers, the topic and the ClickHouse schema |
+| `npm run dev` | `tsx watch` — the edge, reload on save |
+| `npm run dispatch` | the dispatcher loop; needs `INTERNAL_SETTLE_SECRET` |
+| `npm run typecheck` | type-check, no emit (includes tests) |
+| `npm run build` | `src/` → `dist/` (excludes tests) |
+| `npm start` | run compiled `dist/server.js` |
+| `npm test` | `node --test` — no infrastructure needed |
+| `npm run e2e` | end to end against live Kafka + ClickHouse + Postgres |
+| `npm run trace` | walks one signal through every hop, printing each payload |
+| `npm run trace:all` | one signal per case — the matrix in docs/ARCHITECTURE.md |
+| `npm run trace:runner` | the dispatcher LOOP as a process: pacing, backoff, SIGTERM |
+| `npm run loadtest` | the generator in `scripts/loadtest.mjs` |
 
 ## Testing
 
 `buildApp()` is deliberately separate from `server.ts` so tests use
 `app.inject()` with no port binding. Test services as plain functions; test
-routes through `inject`.
+routes through `inject`. Always `await app.close()` in a test that builds an app.
 
-## Not yet set up
+The same rule gives the dispatcher its tests: because `sweepOnce` takes its two
+ports as arguments, a test hands it an array-backed archive and a fake settle
+client, and covers batching, concurrency, retries and the known-filter without a
+container in sight. If a new piece of the pipeline is hard to test, the port is
+probably missing.
 
-- `prisma/` — no schema, no client, no DB chosen yet. Adding it means
-  `npm i prisma @prisma/client`, a `prisma/schema.prisma`, and a
-  `src/plugins/prisma.ts` that decorates the instance (`app.prisma`) and closes
-  the client in `onClose`. Services import that decorator, never their own client.
-- `modules/auth/` — resolution + caching are in place; there is no auth *route*
-  and no session handling.
-- **The full pipeline is wired.** The edge publishes to `signals_pending` (vent)
-  and `signals_accepted` (`signal.controller.ts`, before the 202); two Lambda
-  consumers drain both into ClickHouse; the accepted consumer settles via
-  `/internal/settle` and writes `Processing`/`Processed`/`Failed` events. See "The
-  consumers" in CLAUDE.md.
-- **The money columns are not stored.** `signal_status_events` records only the
-  lifecycle (`status`, `error_code`, `attempt`) — the settle result's credit/cost
-  numbers live in Supabase (`SignalLog`, via `usage_log_id`) and are not copied
-  into ClickHouse here.
+## Not in this repository
+
+- **Postgres, Prisma and all pricing.** They belong to the payments app
+  (`Clocknext-Payment-Saas`), which this repo reaches only over
+  `/api/internal/*`. There is no `prisma/` directory and there should not be
+  one. `pg` is a **devDependency**, used solely by the E2E script to assert on
+  rows.
+- **SQS, Lambda, Redis, and the reject vent.** Earlier versions had all of them
+  — `plugins/redis.ts`, `plugins/sqs.ts`, `plugins/vent.ts`, `modules/vent/`,
+  `client/types.ts`, `workers/pending.handler.ts`, `workers/accepted.handler.ts`.
+  All deleted. `git show HEAD:<path>` still has them if you need the history; do
+  not reintroduce them.
+- **API-key resolution at the edge.** The edge checks a key is *present* and
+  digests it. Who the key belongs to is settled by `/api/internal/settle`. There
+  is no cache and no upstream call on the ingest path.
+- **A linter or formatter.** `npm run typecheck` is the only static gate.

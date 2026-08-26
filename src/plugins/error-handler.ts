@@ -12,13 +12,11 @@ import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify'
 import fp from 'fastify-plugin'
 import {
   errorEnvelope,
-  successEnvelope,
   type ErrorReason,
   type ErrorResult,
   type SignalIssue,
 } from '../utils/envelope.js'
 import { AppError } from '../utils/errors.js'
-import { ventNow } from './vent.js'
 
 /** Fastify's own failures, translated. Anything absent here falls back to the
  *  status-derived default below, so an unmapped code degrades to a truthful
@@ -85,13 +83,11 @@ function summarise(issues: SignalIssue[]): string {
   return first.field ? `${first.field}: ${first.message}` : first.message
 }
 
-/** Sends the envelope, and leaves the two fields the vent needs on the request.
+/** Sends the error envelope.
  *
- *  The reason and its summary are decided HERE, while the response is being
- *  built, but they are needed later: `plugins/vent.ts` publishes from
- *  `onResponse`, by which point the body has gone out and cannot be read back.
- *  Stashing them is what lets the queue message say `INVALID_BODY` instead of
- *  guessing a reason from the status code. */
+ *  Every ≥400 is answered as itself now — the edge is a gate, so a refused
+ *  signal is a plain rejection, not a queued 202. The stamped `signalId` rides
+ *  along so even a hard rejection is quotable back to us. */
 async function send(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -99,13 +95,6 @@ async function send(
   message: string,
   result: ErrorResult,
 ) {
-  request.errorReason = result.errorReason
-  request.errorMessage = message
-
-  if (shouldDefer(request, result.errorReason)) {
-    return deferToQueue(request, reply)
-  }
-
   return reply.status(status).send(
     errorEnvelope(status, message, {
       ...result,
@@ -114,71 +103,6 @@ async function send(
       ...(request.signalId ? { signalId: request.signalId } : {}),
       ...(request.receivedAt ? { receivedAt: request.receivedAt } : {}),
     }),
-  )
-}
-
-/** Reasons that are always answered as themselves, never as a queued 202.
- *
- *  The two auth reasons because a 202 for an unknown key would accept work from
- *  anyone, and the row could never be attributed to an organisation — so nobody
- *  would ever see it in a UI to retry it.
- *
- *  `QUEUE_UNAVAILABLE` because it means a publish just failed. Answering it by
- *  promising a queue is how one broken queue becomes a silent data loss. */
-const NEVER_DEFERRED = new Set<ErrorReason>([
-  'API_KEY_MISSING',
-  'API_KEY_REJECTED',
-  'QUEUE_UNAVAILABLE',
-])
-
-function shouldDefer(request: FastifyRequest, reason: ErrorReason): boolean {
-  // `deferToQueue` is set by the signal module, so a 404 for a path no route
-  // owns is still a 404 — there is no signal in it to process.
-  if (!request.deferToQueue) return false
-  if (NEVER_DEFERRED.has(reason)) return false
-  // Nothing to promise if there is no queue to promise it to.
-  return request.server.queue !== null
-}
-
-/**
- * Answers 202 for a signal that was refused, having first put it on the queue.
- *
- * The reject's `error_code` is already stashed on the request, so the vent
- * carries it to `signals_pending` where the consumer writes the signal's
- * `Failed` event.
- *
- * The publish is awaited, and a failure is re-thrown rather than swallowed.
- * That is the one place this diverges from "only an unset API key is a hard
- * error": `Processing in the queue.` is a promise, and a signal that reached
- * neither the queue nor ClickHouse would be lost in silence — with the caller
- * told it was safe.
- */
-async function deferToQueue(request: FastifyRequest, reply: FastifyReply) {
-  try {
-    await ventNow(request.server, request)
-  } catch (err) {
-    // Answered directly rather than through `send()`, which would route back
-    // into shouldDefer and try to queue this failure too.
-    request.log.error({ err, signalId: request.signalId }, 'could not queue signal')
-    return reply.status(502).send(
-      errorEnvelope(502, 'Could not accept the signal. Retry shortly.', {
-        errorReason: 'QUEUE_UNAVAILABLE',
-        signalId: request.signalId,
-        receivedAt: request.receivedAt,
-      }),
-    )
-  }
-
-  return reply.status(202).send(
-    successEnvelope(
-      {
-        signalId: request.signalId,
-        receivedAt: request.receivedAt,
-        // The same word `signal_status.status` uses: on the queue, not settled.
-        status: 'PENDING' as const,
-      },
-      { statusCode: 202, message: 'Processing in the queue.' },
-    ),
   )
 }
 

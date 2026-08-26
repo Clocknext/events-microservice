@@ -21,34 +21,10 @@ export const signalRoutes: FastifyPluginAsync = async (app) => {
   app.post<{ Body: SignalBody }>(
     '/signal',
     {
-      // Anything over this never reaches the schema — Fastify answers 413.
+      // Anything over this never reaches the schema — Fastify answers 413. The
+      // body is otherwise passed through untouched: the gate reads three fields
+      // and the rest rides to Kafka as sent.
       bodyLimit: config.bodyBytes,
-      // Two normalisations, both mirroring how the payments rulebook READS the
-      // body rather than changing what it means. preValidation runs before the
-      // body schema, which is the whole point of doing them here.
-      preValidation: async (request) => {
-        const body = request.body as { type?: unknown; agentKey?: unknown; key?: unknown } | null
-        if (!body) return
-
-        // `type` is accepted case-insensitively upstream, and JSON Schema cannot
-        // compare against an enum case-insensitively.
-        if (typeof body.type === 'string') {
-          body.type = body.type.trim().toLowerCase()
-        }
-
-        // Upstream reads `agentKey ?? key`, so folding the deprecated alias in
-        // here is semantically identical -- and it means a missing agent key is
-        // reported as `agentKey` alone. Left as an anyOf, AJV named BOTH fields
-        // and told the caller to send `key`, which is the one they should not.
-        // `key` itself is left untouched for anything downstream that reads it.
-        if (
-          (body.agentKey === undefined || body.agentKey === null || body.agentKey === '') &&
-          typeof body.key === 'string' &&
-          body.key.trim() !== ''
-        ) {
-          body.agentKey = body.key
-        }
-      },
       schema: {
         body: signalBodySchema,
         response: {

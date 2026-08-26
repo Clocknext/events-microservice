@@ -4,8 +4,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import { successEnvelope } from '../../utils/envelope.js'
 import { BadGatewayError } from '../../utils/errors.js'
-import { extractBearer } from '../auth/auth.service.js'
-import { buildAcceptedMessage, publishAccepted } from '../vent/vent.service.js'
 import type { SignalBody } from './signal.schema.js'
 import * as signalService from './signal.service.js'
 
@@ -13,57 +11,40 @@ export async function postSignal(
   request: FastifyRequest<{ Body: SignalBody }>,
   reply: FastifyReply,
 ) {
-  const accepted = await signalService.ingestSignal(
-    // `app.cache` is null when Redis is unconfigured or was never reachable;
-    // the service then resolves every signal upstream.
-    request.server.cache,
-    extractBearer(request.headers.authorization),
-    request.body,
-    // Stamped at onRequest, so this is the same id a rejection would have
-    // carried onto the queue. The service does not mint its own.
-    { signalId: request.signalId, receivedAt: request.receivedAt },
-  )
+  // All stamped at onRequest, so this is the id the caller is handed and the id
+  // on the topic — the same signal under one identity. `apiKeyHash` comes from
+  // the module's own hook (the raw key never travels).
+  const identity = {
+    signalId: request.signalId,
+    receivedAt: request.receivedAt,
+    apiKeyHash: request.apiKeyHash,
+  }
+  const message = signalService.buildSignalMessage(request.body, identity)
 
-  // BEFORE the 202, not after, and it throws rather than failing open. This is
-  // the reverse of the reject vent on purpose: an accepted signal is billable,
-  // so acknowledging one that reached no queue would lose it in silence with
-  // the caller told it was safe. A rejected signal's row is only analytics.
-  const acceptedQueue = request.server.acceptedQueue
-  if (acceptedQueue) {
+  // BEFORE the 202, not after, and it throws rather than failing open: an
+  // accepted signal is billable, so acknowledging one that reached no topic
+  // would lose it in silence with the caller told it was safe. `app.producer` is
+  // null when no brokers are configured, in which case a 202 means only "passed
+  // the gate".
+  const producer = request.server.producer
+  if (producer) {
     try {
-      await publishAccepted(
-        acceptedQueue,
-        // The full raw_signals row — the accepted consumer both inserts it and
-        // settles it, and settle needs the customer, type and payload. `body`
-        // is the validated, normalised body the caller sent.
-        buildAcceptedMessage({
-          signalId: accepted.signalId,
-          receivedAt: accepted.receivedAt,
-          organizationId: accepted.organizationId,
-          body: request.body,
-        }),
-      )
+      await producer.send(message)
     } catch (err) {
       throw new BadGatewayError('Could not accept the signal. Retry shortly.', 'QUEUE_UNAVAILABLE', {
-        detail: err instanceof Error ? err.message : 'accepted queue publish failed',
+        detail: err instanceof Error ? err.message : 'kafka produce failed',
       })
     }
   }
 
-  // 202, not 200: the signal is authenticated, well-formed and queued, but
-  // nothing has been settled and no money has moved.
+  // 202, not 200: the signal passed the gate and is on the topic, but nothing
+  // has been settled and no money has moved.
   request.log.info(
-    {
-      signalId: accepted.signalId,
-      organizationId: accepted.organizationId,
-      customerId: request.body.customerId,
-      type: request.body.type,
-      cached: accepted.cached,
-    },
+    { signalId: identity.signalId, customerId: request.body.customerId },
     'signal accepted',
   )
   return reply.status(202).send(
-    successEnvelope(accepted, {
+    successEnvelope(signalService.acceptedResult(identity), {
       statusCode: 202,
       message: 'Signal accepted for processing.',
     }),
