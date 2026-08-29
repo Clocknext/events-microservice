@@ -1,0 +1,15 @@
+[Unit]
+Description=Run signal dispatch reconciliation hourly
+
+[Timer]
+OnCalendar=hourly
+# Spread it off the top of the hour so it does not collide with the minute run
+# and double the load on settle at :00.
+RandomizedDelaySec=300
+# Persistent here EITHER WAY is defensible; false keeps behaviour identical to
+# the minute timer, and a missed hour is itself covered by the next hour's
+# 2-hour window.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

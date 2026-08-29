@@ -29,10 +29,11 @@ every step **by hand**, with no test scripts.
 └──────┬───────┘
        │  the dispatcher reads it
        ▼
-┌──────────────┐   ① GET  /api/internal/signals/cursor   what is left to do?
-│  DISPATCHER  │   ② SELECT … FROM signal_log            candidates
-│  (Node loop) │   ③ POST /api/internal/signals/known    drop the already-settled
-└──────┬───────┘   ④ POST /api/internal/settle           in batches of 500, 2 at a time
+┌──────────────┐   ① SELECT … FROM signal_log            everything ingested in
+│  DISPATCHER  │                                          the last DISPATCH_WINDOW_MS
+│ (one-shot,   │   ② POST /api/internal/settle            ALL of it, one gzipped call
+│  60s timer)  │                                          then exit
+└──────┬───────┘
        │
        ▼
 ┌──────────────┐
@@ -48,7 +49,7 @@ every step **by hand**, with no test scripts.
 | Edge | identity (`signalId`, `receivedAt`, `apiKeyHash`), the shape gate | resolve the key, know the pricing rulebook, touch ClickHouse |
 | Kafka | durability and replay | anything else — it is one topic |
 | ClickHouse | the verbatim archive | record outcomes (it has no row updates) |
-| Dispatcher | carrying archive → settle, at least once | decide anything about money |
+| Dispatcher | carrying archive → settle, at least once | decide anything about money, or remember anything at all |
 | Payments | pricing, Postgres, the lifecycle record | know that Kafka or ClickHouse exist |
 
 ### The one property everything rests on
@@ -68,8 +69,10 @@ result = await settleSignal(db, {
 
 So **sending the same signal twice cannot charge twice** — the second one replays
 onto the original money row. That single fact is why the dispatcher needs no
-claim, no lease, no visibility timeout and no cursor table: it only has to
-guarantee *at least once*, and over-sending is free.
+claim, no lease, no visibility timeout, no cursor table and — since the 1.0
+dispatch model — no state whatsoever: it only has to guarantee *at least once*,
+and over-sending is free. The dispatcher leans on that hard enough to re-send
+every signal about three times on purpose.
 
 ---
 
@@ -153,38 +156,53 @@ FROM signals.kafka_signals;
 survives with its nesting intact. The Kafka engine commits offsets only after
 this insert lands — that is what makes ingestion at-least-once.
 
-### 2.5 The dispatcher sweep
+### 2.5 The dispatch run
 
 The whole of it, as a pure function over two ports:
 
 ```ts
 // edge · src/workers/dispatch/dispatch.service.ts
-export async function sweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
-  const cursor = await payments.cursor(config.batchSize)
+export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
+  // ① everything INGESTED in the window. No cursor, no watermark, no filter.
+  const rows = await archive.readIngested({ windowMs, since, until, cap: maxRows })
 
-  // ① retries first — named explicitly, so a flood of new work cannot crowd
-  //    them out, and one ancient failure cannot drag the scan back with it
-  for (const row of await archive.readByIds([...attemptOf.keys()])) { … }
+  // ② map, dropping anything unusable rather than sending it half-built
+  const signals = rows.map((r) => toSettleSignal(r)).filter(Boolean)
 
-  // ② then new work, from the watermark MINUS an overlap window
-  const since = overlapFrom(cursor.sentThrough, config.overlapMs)
-  const candidates = await archive.readNewer(since, room)
-
-  // ③ drop anything already recorded, or the overlap would re-settle
-  //    the same signals on every sweep and the pipeline would never go quiet
-  const known = new Set(await payments.known(candidates.map((r) => r.signal_id)))
-
-  // ④ settle, batchSize at a time, concurrency in flight
-  await pool(batches.map((batch, i) => () => payments.settle(batchIds[i], batch)), concurrency)
+  // ③ one call. All of it. No batching, no concurrency.
+  const { results } = await payments.settle(batchId, signals)
 }
 ```
 
-**Why the overlap window.** ClickHouse's Kafka engine flushes in batches and
-several edge instances stamp `receivedAt` from their own clocks, so a row can
-appear with a timestamp just *below* one already seen. Reading strictly forward
-from a watermark would lose it, permanently and silently. Reading back
-`DISPATCH_OVERLAP_MS` catches it; step ③ is what stops that overlap becoming an
-infinite re-settle loop.
+**How it knows what "the latest data" is.** The window is over `ingested_at` —
+ClickHouse's own `DEFAULT now64(3)`, stamped when the materialized view's insert
+lands:
+
+```sql
+WHERE ingested_at >= now64(3) - ({windowMs:UInt64} / 1000)
+ORDER BY ingested_at ASC
+LIMIT 1 BY signal_id
+LIMIT {cap:UInt32}
+```
+
+Three things in that clause are deliberate, and each is silent when wrong:
+
+- **`ingested_at`, not `received_at`.** `received_at` is the *caller's* time,
+  stamped by N edge instances off N clocks. A row can land in the archive minutes
+  after it — the Kafka engine flushes in batches, and a broker backlog delays it
+  further. With no watermark anywhere in this design, a window over `received_at`
+  would skip that row **permanently**. `received_at` is still what settle bills on:
+  two clocks, two jobs.
+- **`now64(3)`, not `Date.now()`.** The bound is computed by ClickHouse, because
+  `ingested_at` was stamped by ClickHouse. A bound derived from the dispatcher's
+  clock would shift the window by whatever skew exists between the two machines.
+- **No upper bound.** The window runs to this instant so consecutive runs overlap.
+  A gap between one run's window and the next is a lost row.
+
+It also needs an index. `ingested_at` is neither the `ORDER BY` key
+(`received_at, signal_id`) nor the partition key, so without the `minmax` skip
+index from migration `002` the window is a full scan of every partition, reading
+the fat `payload` column.
 
 **The timestamp conversion that prevents mis-billing:**
 
@@ -205,7 +223,7 @@ dispatcher in IST would bill every signal 5½ hours early. Billing windows cut o
 **The caller cannot forge the envelope:**
 
 ```ts
-export function toSettleSignal(row: SignalLogRow, attempt: number): SettleSignal | null {
+export function toSettleSignal(row: SignalLogRow, attempt = 1): SettleSignal | null {
   …
   delete payload.organizationId          // caller-controlled — never forwarded
   return {
@@ -213,31 +231,49 @@ export function toSettleSignal(row: SignalLogRow, attempt: number): SettleSignal
     signalId: row.signal_id,             // …then written over
     receivedAt: toIso(row.received_at),
     apiKeyHash: row.api_key_hash,
-    attempt,
+    attempt,                             // always 1 — nothing here counts deliveries
   }
 }
 ```
 
-### 2.6 The pace is self-adjusting
+### 2.6 The overlap is the error recovery
 
 ```ts
 // edge · src/workers/dispatch/dispatch.runner.ts
-while (!stopping) {
-  const outcome = await sweepOnce(deps)
-  if (!outcome.saturated) await sleep(config.dispatchIdleMs)   // caught up → nap
-  // saturated → straight round again, no sleep
-}
+const outcome = await runOnce(buildDeps())
+line('dispatch.run', { ...outcome })
+// then exit. 0 sent-or-nothing-to-send, 1 transient, 2 misconfigured.
 ```
 
-A full batch means there is probably more behind it, so drain flat out; a short
-one means idle cheaply. A cron can do neither — it adds latency when idle and
-cannot catch up when behind.
+No loop, no nap, no backoff. The timer fires every 60s; the window reaches back
+3 minutes. So every signal is read and sent about **three times**, and settle
+discards all but the first.
 
-**Batch size buys nothing; concurrency does.** Settle splits a batch across
-`INTERNAL_WORKER` workers that each walk their chunk *one signal at a time*, so
-a 5,000-signal batch is not faster than ten 500s — it is the same rate with ten
-times the blast radius on a timeout. Hence `DISPATCH_BATCH_SIZE=500` (settle's
-own enforced cap) and `DISPATCH_CONCURRENCY=2`.
+That is not waste, it is the entire recovery mechanism. Nothing is written down
+between runs, so a run that dies has nothing to resume from — and does not need
+anything, because the next two runs cover exactly the same rows. It is also why
+there is no backoff in the process: the tick *is* the retry, and a one-shot that
+cannot reach ClickHouse has nothing to wait around for.
+
+What three re-sends cannot cover is three consecutive failures. Those rows leave
+the window and are never sent again, which is what the **hourly reconciliation
+timer** is for: the same binary, `DISPATCH_WINDOW_MS=7200000`, re-sending two
+hours of already-settled signals every hour.
+
+**One call, whatever the size — and gzipped.** No batch size and no concurrency,
+which means settle must accept a single call of arbitrary size: its 500 cap
+removed, and its `INTERNAL_WORKER` per-signal walk replaced by a bulk insert. The
+constraint that remains is the transport, not the route: Vercel caps a serverless
+function's request body at **4.5MB**, and raw signal JSON crosses that at roughly
+15k signals — inside one window at production volume. Signal JSON is the same keys
+repeated thousands of times, so gzip buys about 10:1, and
+`dispatch.body_near_limit` warns before the ceiling because crossing it is a hard
+413 for the entire window at once.
+
+**`run.capped` means rows were lost.** `DISPATCH_MAX_ROWS` bounds what one run
+holds in memory. Hitting it means the window had more than that and the next
+window has already moved past some of them; the hourly reconciliation covers up to
+two hours of it, and past that it needs `DISPATCH_SINCE` and a human.
 
 ### 2.7 Settle: attribute → price → record
 
@@ -307,17 +343,18 @@ explicit admin action.
 | `KAFKA_USE_IAM` | `false` | MSK Serverless; token signed from the AWS default chain |
 | `BODY_BYTES` | `65536` | over this is a 413 |
 
-**Dispatcher** (same process family, separate entry point):
+**Dispatcher** (same process family, separate entry point — a one-shot on a timer):
 
 | Var | Default | Notes |
 | --- | --- | --- |
 | `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | read-only |
 | `PAYMENTS_URL` | `http://127.0.0.1:3001` | |
-| `INTERNAL_SETTLE_SECRET` | *(required)* | refuses to start without it |
-| `DISPATCH_BATCH_SIZE` | `500` | settle's enforced cap |
-| `DISPATCH_CONCURRENCY` | `2` | throughput lever; keep ≤ `INTERNAL_BATCH_CONCURRENCY` |
-| `DISPATCH_IDLE_MS` | `1000` | nap only when caught up |
-| `DISPATCH_OVERLAP_MS` | `300000` | how far below the watermark to re-read |
+| `INTERNAL_SETTLE_SECRET` | *(required)* | exits 2 without it |
+| `DISPATCH_WINDOW_MS` | `180000` | how far back, over `ingested_at`. 3× the timer's interval — that overlap IS the error recovery |
+| `DISPATCH_MAX_ROWS` | `100000` | an OOM guard, **not** a batch size. Hitting it loses rows; alarm on `run.capped` |
+| `DISPATCH_TIMEOUT_MS` | `310000` | must exceed settle's `maxDuration`, or a call that is still committing gets abandoned |
+| `DISPATCH_GZIP` | `true` | off only to debug against a server that does not decompress |
+| `DISPATCH_SINCE` / `DISPATCH_UNTIL` | *(empty)* | explicit `[since, until)` over `ingested_at` — the manual replay tool |
 
 ---
 
@@ -419,21 +456,27 @@ docker exec clickhouse clickhouse-client -q "
   SELECT count() FROM signals.signal_log WHERE position(payload, '$KEY') > 0"   # → 0
 ```
 
-### Step 5 · Start payments and ask what is outstanding
+### Step 5 · Start payments, and see what the window holds
+
+There is nothing to ask the payments app here — the dispatcher never asks it what
+is outstanding. What goes out is decided entirely by one query against the
+archive:
 
 ```bash
 cd /path/to/Clocknext-Payment-Saas && npx next dev -p 3001    # another terminal
 
-curl -s -H "authorization: Bearer $INTERNAL_SETTLE_SECRET" \
-  "$PAY/api/internal/signals/cursor?retryLimit=5" | jq -c .result
+docker exec clickhouse clickhouse-client -q "
+  SELECT signal_id, received_at, ingested_at
+    FROM signals.signal_log
+   WHERE ingested_at >= now64(3) - 180
+   ORDER BY ingested_at ASC
+   LIMIT 1 BY signal_id"
 ```
 
-```json
-{"sentThrough":null,"retry":[],"maxAttempts":5}
-```
-
-`sentThrough: null` means nothing has ever settled, so the dispatcher will sweep
-the archive from the beginning.
+Note `ingested_at` in the WHERE and `received_at` merely selected: the window is
+over when ClickHouse *wrote* the row, while `received_at` is what settle bills on.
+Filtering on `received_at` instead would silently skip anything Kafka delivered
+late.
 
 ### Step 6 · Settle it — either way
 
@@ -446,7 +489,10 @@ INTERNAL_SETTLE_SECRET=$INTERNAL_SETTLE_SECRET \
 npm run dispatch
 ```
 
-It logs one JSON line per sweep. Ctrl-C when the sweeps go quiet.
+It logs one JSON line and **exits** — it is a one-shot, so there is nothing to
+Ctrl-C. Run it again and it sends the same signals a second time; settle collapses
+them onto the same money row. In production a systemd timer does exactly that,
+once a minute ([deploy/systemd/README.md](../deploy/systemd/README.md)).
 
 **6b · Or do it by hand**, to see each call. Build the batch straight out of
 ClickHouse — this is exactly what `toSettleSignal` does:
@@ -536,21 +582,25 @@ psql "$PG" -x -c "select \"signalId\", \"organizationId\", \"customerId\",
 `receivedAt` must equal the edge's stamp to the millisecond. If it is off by your
 local UTC offset, the ClickHouse timestamp conversion has regressed.
 
-### Step 8 · Confirm the pipeline goes quiet
+### Step 8 · Confirm the re-send is inert
+
+The pipeline does **not** go quiet — it cannot. The window is wider than the
+timer's interval, so the next run reads the same signal again and sends it again.
+What has to hold is that doing so changes nothing:
 
 ```bash
-curl -s -X POST $PAY/api/internal/signals/known \
-  -H 'content-type: application/json' \
-  -H "authorization: Bearer $INTERNAL_SETTLE_SECRET" \
-  -d "{\"signalIds\":[\"$SIG\"]}" | jq -c .result
+psql "$PG" -t -c "select count(*), coalesce(sum(\"creditsUsed\"),0)
+                    from \"SignalLog\" where \"signalId\" = '$SIG'"
+
+npm run dispatch    # sends it again
+
+psql "$PG" -t -c "select count(*), coalesce(sum(\"creditsUsed\"),0)
+                    from \"SignalLog\" where \"signalId\" = '$SIG'"
 ```
 
-```json
-{"known":["01M0XCANFDVKBSB3R319GDBZMR"]}
-```
-
-Once a signal is `known`, the dispatcher stops re-sending it even though the
-overlap window still re-reads it. That is what makes a caught-up pipeline idle.
+Both must print `1 | <same credits>`. That is convergence in this design: not an
+idle pipeline, but a re-send that costs nothing because `SignalLog.signalId` is
+UNIQUE and is the idempotency key.
 
 ### Step 9 · Prove idempotency by hand
 
@@ -607,10 +657,10 @@ docker exec clickhouse clickhouse-client -q "
 
 | Command | Where | What |
 | --- | --- | --- |
-| `npm test` | edge | 47 unit tests — the gate, the envelope, the sweep |
-| `npm run e2e` | edge | 110 checks, real Kafka + ClickHouse + Postgres |
+| `npm test` | edge | 59 unit tests — the gate, the envelope, the dispatch run |
+| `npm run e2e` | edge | the full pipeline, real Kafka + ClickHouse + Postgres |
 | `npm run verify:signal-status` | payments | 15 checks on attribution + the status writer |
-| `npm run dispatch` | edge | the dispatcher itself |
+| `npm run dispatch` | edge | one dispatch run, then exits |
 
 `npm run e2e` needs the three services from steps 1-5 already running. It
 borrows a real API key row, swaps its hash for one it knows, and restores it in a

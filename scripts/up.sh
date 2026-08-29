@@ -8,16 +8,17 @@
 #
 #   npm run up              CLEAN SLATE — recreates the containers, so ClickHouse
 #                           comes up with the tables and no rows, and Kafka with
-#                           no messages. This is the default because a stale
-#                           archive means the dispatcher's first run backfills it.
+#                           no messages. Default because a stale archive makes
+#                           every count and every assertion below ambiguous.
 #
 #   npm run up -- --keep    keep whatever is already there
 #
 # Local data only: the archive is derived from the topic, and both live in
 # throwaway containers. Nothing here touches Postgres.
 #
-# It does NOT start the edge, the dispatcher or the payments app. Those are
-# long-lived processes and belong in their own terminals where you can see them.
+# It does NOT start the edge or the payments app — those are long-lived processes
+# and belong in their own terminals. The dispatcher is not long-lived at all: it is
+# a one-shot you run (or a timer runs) whenever you want the archive swept.
 
 set -euo pipefail
 
@@ -112,15 +113,15 @@ KAFKA_TOPIC="$(env_get .env KAFKA_TOPIC || echo signals)"
 KAFKA_TOPIC="${KAFKA_TOPIC:-signals}"
 CH_DB="$(env_get .env CLICKHOUSE_DATABASE || echo signals)"
 CH_DB="${CH_DB:-signals}"
-# One partition today. See docs/ARCHITECTURE.md §8 — repartitioning later moves
-# key→partition placement, so this is a decision to make before production.
+# ONE partition — matches production (docs/AWS-SETUP.md Step 0). Grow to 3 on a
+# measured symptom, not speculatively: `KAFKA_PARTITIONS=3 npm run up` does it
+# locally, and the --alter branch below grows an existing topic in place.
 PARTITIONS="${KAFKA_PARTITIONS:-1}"
 
 # ── 2 · containers ───────────────────────────────────────────────────────────
 # Clean by default. `down -v` takes the clickhouse-data volume with it, and Kafka
-# keeps its log in the container's own layer, so both come back empty — which is
-# the point: with rows in the archive and none in SignalStatus, the dispatcher's
-# first run treats the whole archive as outstanding and backfills it.
+# keeps its log in the container's own layer, so both come back empty. That is the
+# point: a leftover archive makes the row counts below meaningless.
 step "2 · kafka + clickhouse"
 if [ "$KEEP" = "1" ]; then
   ok "--keep: leaving existing data alone"
@@ -218,21 +219,23 @@ else
   warn "not found at $PAYMENTS_DIR — set PAYMENTS_DIR if it lives elsewhere"
 fi
 
-# ── 6 · the backlog check ────────────────────────────────────────────────────
-# The dispatcher's watermark is `max(receivedAt)` over SignalStatus. With that
-# table empty, EVERY row in the archive is outstanding, so its first run sweeps
-# the lot. A clean slate makes that a non-issue; --keep does not.
-step "6 · backlog check"
+# ── 6 · archive sanity ──────────────────────────────────────────────────────
+# NOT a backlog check any more. The dispatcher reads a WINDOW over `ingested_at`
+# (DISPATCH_WINDOW_MS, 3 min by default) and keeps no watermark, so old archive
+# rows are simply not in scope — there is nothing for a first run to backfill and
+# no cold-start guard to trip. This is only here so the counts you are about to
+# assert on are not confused by leftovers.
+step "6 · archive sanity"
 ARCHIVE_ROWS=$(ch -q "SELECT count() FROM $CH_DB.signal_log" 2>/dev/null || echo 0)
 if [ "${ARCHIVE_ROWS:-0}" -eq 0 ]; then
-  ok "archive is empty — the dispatcher starts with nothing to catch up on"
+  ok "archive is empty"
 else
-  warn "the archive holds $ARCHIVE_ROWS row(s)."
-  warn "If SignalStatus is empty, the dispatcher's first run will sweep them ALL."
-  warn "The dispatcher refuses to do that by default — see DISPATCH_COLD_START_MAX."
+  warn "the archive holds $ARCHIVE_ROWS row(s) from an earlier session."
+  warn "Harmless — they are outside the dispatch window — but they will show up in"
+  warn "any 'SELECT count() FROM signal_log' you run below."
   echo
   echo "    npm run up               start clean instead (recreates the containers)"
-  echo "    DISPATCH_COLD_START_MAX=0 npm run dispatch    backfill deliberately"
+  echo "    DISPATCH_SINCE=... DISPATCH_UNTIL=... npm run dispatch    replay them on purpose"
 fi
 
 # ── done ─────────────────────────────────────────────────────────────────────

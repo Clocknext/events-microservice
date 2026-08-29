@@ -1,45 +1,54 @@
 /** The dispatcher's logic. A pure function over its two ports — no HTTP client,
- *  no ClickHouse driver, no clock of its own beyond `Date.now()`.
+ *  no ClickHouse driver.
  *
  *  ─────────────────────────────────────────────────────────────────────────────
- *  WHY THERE IS NO CLAIM, NO LEASE, NO CURSOR TABLE
+ *  ONE RUN, ONE WINDOW, ONE CALL
  *
- *  `/api/internal/settle` is idempotent on `signalId`: `SignalLog.signalId` is
- *  UNIQUE and settle passes it as the idempotency key, so a signal sent twice
- *  replays onto the original money row instead of charging the customer again.
+ *  A systemd timer runs this every 60s. It reads every row INGESTED in the last
+ *  `DISPATCH_WINDOW_MS`, turns those rows into settle signals, and posts all of
+ *  them in a single request. Then it exits.
  *
- *  That single fact removes the machinery a queue would need. The dispatcher only
- *  has to guarantee AT LEAST ONCE. Over-sending costs a cheap replay, so there is
- *  nothing to lock, nothing to lease, and no visibility timeout to get wrong —
- *  and two dispatchers running at once are safe rather than a corruption bug.
+ *  There is no watermark, no cursor, no claim, no lease and no local state,
+ *  because `/api/internal/settle` is idempotent on `signalId`: `SignalLog.signalId`
+ *  is UNIQUE and settle uses it as the idempotency key, so a signal sent twice
+ *  replays onto the original money row instead of charging again.
  *
- *  WHAT IS STILL OUTSTANDING is answered by Postgres (`SignalStatus`), not by
- *  ClickHouse, which has no row updates and therefore records no outcome. The
- *  sweep is a watermark for new work plus an explicit list of retries, so one
- *  ancient failure cannot drag the scan back across the whole archive.
+ *  So the run never asks what it already sent. The window is deliberately WIDER
+ *  than the timer's interval — 3x by default — and every signal is therefore sent
+ *  about three times, with settle discarding all but the first. That overlap is
+ *  not waste: it is the ENTIRE error recovery. A run that fails leaves nothing
+ *  behind to resume from, and is simply covered by the next two.
+ *
+ *  What the overlap cannot cover is three consecutive failures. That is what the
+ *  hourly reconciliation timer is for — the same binary with a 2-hour window.
  *  ───────────────────────────────────────────────────────────────────────────── */
 import type {
   ArchiveReader,
+  RunOutcome,
   SettleClient,
   SettleSignal,
   SignalLogRow,
-  SweepOutcome,
 } from './dispatch.schema.js'
 
-export interface SweepConfig {
-  batchSize: number
-  concurrency: number
-  /** How far below the watermark to re-read, in ms. */
-  overlapMs: number
+export interface RunConfig {
+  /** How far back the window reaches, over `ingested_at`. */
+  windowMs: number
+  /** Explicit `[since, until)` for a manual replay. Empty in normal operation. */
+  since?: string | undefined
+  until?: string | undefined
+  /** Row ceiling. An OOM guard, not a batch size. */
+  maxRows: number
 }
 
-export interface SweepDeps {
+export interface RunDeps {
   archive: ArchiveReader
   payments: SettleClient
-  config: SweepConfig
-  /** Injected so a test is not at the mercy of a real clock or a real UUID. */
+  config: RunConfig
+  /** Injected so a test is not at the mercy of a real UUID. */
   newBatchId: () => string
   log?: (event: string, detail: Record<string, unknown>) => void
+  /** Injected so a test can assert on `ms` without a real clock. */
+  now?: () => number
 }
 
 /**
@@ -57,15 +66,6 @@ export function toIso(clickhouseTimestamp: string): string {
   return `${trimmed.replace(' ', 'T')}Z`
 }
 
-/** Shifts a watermark back by the overlap, so a row that lands with a timestamp
- *  just below one already seen is still picked up. */
-export function overlapFrom(sentThrough: string | null, overlapMs: number): string | null {
-  if (!sentThrough) return null
-  const at = new Date(sentThrough).getTime()
-  if (Number.isNaN(at)) return null
-  return new Date(at - overlapMs).toISOString()
-}
-
 /**
  * Turns an archive row into the signal settle wants.
  *
@@ -77,7 +77,7 @@ export function overlapFrom(sentThrough: string | null, overlapMs: number): stri
  * row that cannot be turned into a signal must be skipped loudly, not sent
  * half-built.
  */
-export function toSettleSignal(row: SignalLogRow, attempt: number): SettleSignal | null {
+export function toSettleSignal(row: SignalLogRow, attempt = 1): SettleSignal | null {
   let payload: Record<string, unknown>
   try {
     const parsed = JSON.parse(row.payload) as unknown
@@ -97,143 +97,58 @@ export function toSettleSignal(row: SignalLogRow, attempt: number): SettleSignal
     signalId: row.signal_id,
     receivedAt: toIso(row.received_at),
     apiKeyHash: row.api_key_hash,
+    // Always 1: this process keeps no state, so it cannot know which delivery
+    // this is. `SignalStatus` counts attempts, on the side that can see them.
     attempt,
   }
 }
 
-/** Ceiling on how many pages one sweep will walk looking for unsettled rows.
- *  Bounds the work when the overlap window is far wider than the batch; the
- *  sweep simply resumes next time rather than scanning without limit. */
-const MAX_PAGES = 20
-
-/** Splits into chunks of at most `size`. */
-function chunk<T>(items: T[], size: number): T[][] {
-  const out: T[][] = []
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
-  return out
-}
-
-/** Runs the thunks with at most `limit` in flight, preserving result order. */
-async function pool<T>(thunks: (() => Promise<T>)[], limit: number): Promise<T[]> {
-  const results = new Array<T>(thunks.length)
-  let next = 0
-  const runners = Array.from({ length: Math.min(limit, thunks.length) }, async () => {
-    while (true) {
-      const index = next
-      next += 1
-      const thunk = thunks[index]
-      if (!thunk) return
-      results[index] = await thunk()
-    }
-  })
-  await Promise.all(runners)
-  return results
-}
-
 /**
- * One sweep: ask what is left, read those rows out of the archive, settle them.
+ * One run: read the window, send it, count what came back.
  *
- * Returns what it did so the runner can decide whether to loop again straight
- * away (a full batch means there is probably more) or nap.
+ * Throws whatever the ports throw. That is deliberate — the runner turns it into
+ * a non-zero exit and the next window re-sends the same signals, so there is
+ * nothing to absorb here and swallowing it would hide a total failure behind a
+ * successful-looking run.
  */
-export async function sweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
+export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
   const { archive, payments, config, newBatchId } = deps
   const log = deps.log ?? (() => {})
-  const empty: SweepOutcome = {
-    read: 0, sent: 0, processed: 0, userError: 0, serverError: 0,
-    skipped: 0, alreadyKnown: 0, pages: 0, saturated: false, batchIds: [],
+  const now = deps.now ?? Date.now
+  const startedAt = now()
+  const batchId = newBatchId()
+
+  const rows = await archive.readIngested({
+    windowMs: config.windowMs,
+    since: config.since,
+    until: config.until,
+    cap: config.maxRows,
+  })
+
+  // Hitting the cap MEANS ROWS WERE LEFT UNSENT, and the next window will have
+  // moved past some of them — this is a data-loss alarm, not a tuning hint. The
+  // hourly reconciliation covers up to two hours of it; past that it needs
+  // DISPATCH_SINCE and a human.
+  const capped = rows.length >= config.maxRows
+  if (capped) {
+    log('run.capped', {
+      read: rows.length,
+      cap: config.maxRows,
+      windowMs: config.windowMs,
+    })
   }
 
-  const cursor = await payments.cursor(config.batchSize)
-
-  // Retries first — they are the oldest work and are named explicitly, so they
-  // cannot be crowded out by a flood of new signals.
-  const attemptOf = new Map<string, number>()
-  for (const entry of cursor.retry) attemptOf.set(entry.signalId, entry.nextAttempt)
-
-  const rows: SignalLogRow[] = []
-  const seen = new Set<string>()
-  if (attemptOf.size > 0) {
-    for (const row of await archive.readByIds([...attemptOf.keys()])) {
-      if (seen.has(row.signal_id)) continue
-      seen.add(row.signal_id)
-      rows.push(row)
-    }
-    // A retry the archive no longer holds (TTL, or a truncate-and-replay) can
-    // never be settled. Say so — silently dropping it would leave it PENDING
-    // forever with nobody looking.
-    const missing = [...attemptOf.keys()].filter((id) => !seen.has(id))
-    if (missing.length > 0) {
-      log('retry.missing_from_archive', { count: missing.length, sample: missing.slice(0, 5) })
-    }
+  const empty: RunOutcome = {
+    read: rows.length, sent: 0, skipped: 0,
+    processed: 0, userError: 0, serverError: 0,
+    capped, bytes: 0, gzipBytes: 0, ms: now() - startedAt, batchId,
   }
-
-  // Then new work, up to whatever room is left in the batch.
-  //
-  // The read starts BELOW the watermark by the overlap window, because a row can
-  // land with a `received_at` just under one already seen (ClickHouse's Kafka
-  // engine flushes in batches, and several edge instances stamp the time from
-  // their own clocks). Without that overlap a late arrival is lost for good.
-  //
-  // But the overlap must not mean re-settling the same signals every sweep. That
-  // would be harmless — settle dedups on `signalId` — and still ruinous: the
-  // pipeline would never go quiet and the whole window would be re-priced once a
-  // second. So the candidates are checked against the status rows and anything
-  // already recorded is dropped. Retries are exempt: the cursor named them
-  // deliberately, and they are already in `rows`.
-  //
-  // It PAGES, and that is not an optimisation. The known-filter runs after the
-  // read, so if a single page were all it looked at, an overlap window holding
-  // more settled rows than one page would be read, filtered away entirely, and
-  // the new work behind it would never be reached — every sweep sending nothing
-  // while the backlog grows. The keyset cursor is what lets it walk past the
-  // settled rows to the ones that still need doing.
-  let alreadyKnown = 0
-  let pages = 0
-  const room = config.batchSize * config.concurrency - rows.length
-  if (room > 0) {
-    const since = overlapFrom(cursor.sentThrough, config.overlapMs)
-    let after: { receivedAt: string; signalId: string } | null = null
-    const wanted = rows.length + room
-
-    while (rows.length < wanted && pages < MAX_PAGES) {
-      pages += 1
-      const page = await archive.readNewer({ sinceIso: since, after, limit: room })
-      if (page.length === 0) break
-
-      const last = page[page.length - 1]!
-      after = { receivedAt: last.received_at, signalId: last.signal_id }
-
-      const fresh = page.filter((row) => !seen.has(row.signal_id))
-      if (fresh.length > 0) {
-        const known = new Set(await payments.known(fresh.map((row) => row.signal_id)))
-        alreadyKnown += known.size
-        for (const row of fresh) {
-          if (known.has(row.signal_id)) continue
-          if (rows.length >= wanted) break
-          seen.add(row.signal_id)
-          rows.push(row)
-        }
-      }
-      // A short page means the archive is exhausted — nothing to page towards.
-      if (page.length < room) break
-    }
-
-    if (pages >= MAX_PAGES && rows.length < wanted) {
-      // The window holds more settled rows than MAX_PAGES can walk. Not a
-      // correctness problem — the next sweep starts again from the same place
-      // and the watermark advances as work completes — but it means the overlap
-      // is too wide for the throughput, so say so rather than quietly crawling.
-      log('sweep.page_cap', { pages, alreadyKnown, overlapMs: config.overlapMs })
-    }
-  }
-
-  if (rows.length === 0) return { ...empty, alreadyKnown, pages }
+  if (rows.length === 0) return empty
 
   const signals: SettleSignal[] = []
   let skipped = 0
   for (const row of rows) {
-    const signal = toSettleSignal(row, attemptOf.get(row.signal_id) ?? 1)
+    const signal = toSettleSignal(row)
     if (!signal) {
       skipped += 1
       log('row.unusable', { signalId: row.signal_id })
@@ -241,36 +156,14 @@ export async function sweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
     }
     signals.push(signal)
   }
-  if (signals.length === 0) {
-    return { ...empty, read: rows.length, skipped, alreadyKnown, pages }
-  }
+  if (signals.length === 0) return { ...empty, skipped, ms: now() - startedAt }
 
-  const batches = chunk(signals, config.batchSize)
-  const batchIds = batches.map(() => newBatchId())
-  const settled = await pool(
-    batches.map((batch, i) => async () => {
-      const batchId = batchIds[i]!
-      try {
-        return await payments.settle(batchId, batch)
-      } catch (err) {
-        // The whole batch is unresolved. Nothing is recorded for it, so the next
-        // sweep picks the same signals up again — which is safe, because settle
-        // dedups on `signalId`.
-        log('batch.failed', {
-          batchId,
-          signals: batch.length,
-          error: err instanceof Error ? err.message : String(err),
-        })
-        return [] as Awaited<ReturnType<SettleClient['settle']>>
-      }
-    }),
-    config.concurrency,
-  )
+  const { results, bytes, gzipBytes } = await payments.settle(batchId, signals)
 
   let processed = 0
   let userError = 0
   let serverError = 0
-  for (const result of settled.flat()) {
+  for (const result of results) {
     if (result.status === 'PROCESSED') processed += 1
     else if (result.error_type === 'USER_ERROR') userError += 1
     else serverError += 1
@@ -279,15 +172,14 @@ export async function sweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
   return {
     read: rows.length,
     sent: signals.length,
+    skipped,
     processed,
     userError,
     serverError,
-    skipped,
-    alreadyKnown,
-    pages,
-    // Saturated when the sweep filled every batch it was allowed — the signal to
-    // loop again with no nap.
-    saturated: signals.length >= config.batchSize * config.concurrency,
-    batchIds,
+    capped,
+    bytes,
+    gzipBytes,
+    ms: now() - startedAt,
+    batchId,
   }
 }

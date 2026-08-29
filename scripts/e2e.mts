@@ -4,7 +4,7 @@
  *   edge (Fastify) → Kafka → ClickHouse → dispatcher → /api/internal/settle → Postgres
  *
  * Nothing is mocked. Real HTTP into the edge, real Kafka, the real ClickHouse
- * Kafka engine, the real dispatcher sweep, the real settle route, real Postgres
+ * Kafka engine, the real dispatcher run, the real settle route, real Postgres
  * rows — and a real org, plan, credit and model borrowed from the database.
  *
  * PREREQUISITES
@@ -19,14 +19,13 @@
 import './e2e/preload.mjs'
 import { config } from '../src/config.js'
 import { toIso, toSettleSignal } from '../src/workers/dispatch/dispatch.service.js'
-import { fetchCursor } from '../src/client/payments-client.js'
 import {
   archiveRow, archiveRowCount, check, clickhouse, heading, postSettle, postSignal,
   report, sha256, sleep, waitFor, PAYMENTS,
 } from './e2e/harness.mjs'
 import {
-  db, EXPIRED_KEY, KEY, KEY_HASH, preflight, remember, RUN, setup, statusOf,
-  sweepUntilQuiet, teardown, UNKNOWN_KEY, waitForStatus, type Fixture,
+  db, dispatch, EXPIRED_KEY, KEY, KEY_HASH, preflight, remember, RUN, setup,
+  statusOf, teardown, UNKNOWN_KEY, waitForStatus, type Fixture,
 } from './e2e/fixtures.mjs'
 
 /** A body the borrowed org / plan / credit / model will actually settle. */
@@ -107,10 +106,12 @@ async function edgeRejections(fx: Fixture): Promise<void> {
   heading('3 · a refused request reaches neither Kafka nor the archive')
   const before = Number((await db.one<{ n: string }>(`select count(*) n from "SignalStatus"`))!.n)
   await sleep(2_000)
-  const sweeps = await sweepUntilQuiet(2)
+  await dispatch()
   const after = Number((await db.one<{ n: string }>(`select count(*) n from "SignalStatus"`))!.n)
   check(`${cases.length} refused requests produced 0 new status rows`, after - before, 0)
-  check('and 0 signals were swept', sweeps.reduce((n, s) => n + s.sent, 0), 0)
+  // There is deliberately no assertion on `outcome.sent` here. It counts
+  // everything in the window, re-sent on every run by design, so it says nothing
+  // about whether these requests produced work. Postgres is the evidence.
 
   const quoted = await postSignal({ inputTokens: 1, outputTokens: 1 }, { key: KEY })
   check('a rejected request still returns a quotable ULID',
@@ -134,8 +135,8 @@ async function happyPath(fx: Fixture): Promise<string | null> {
   check('and the raw key appears nowhere in the payload', row.payload.includes(KEY), false)
   check('the payload is the body as sent', JSON.parse(row.payload).customerId, fx.customerId)
 
-  const sweeps = await sweepUntilQuiet()
-  check('the dispatcher settled it', sweeps.reduce((n, s) => n + s.processed, 0) >= 1, true)
+  const run = await dispatch()
+  check('the dispatcher settled it', run.processed >= 1, true)
 
   const status = await waitForStatus(signalId)
   check('a SignalStatus row exists', status !== null, true)
@@ -179,7 +180,7 @@ async function attribution(fx: Fixture): Promise<void> {
   check('so is one with an expired key', expired !== null, true)
   if (!unknown || !expired) return
 
-  await sweepUntilQuiet()
+  await dispatch()
 
   const u = await waitForStatus(unknown)
   check('an unknown key is a USER_ERROR', {
@@ -196,12 +197,17 @@ async function attribution(fx: Fixture): Promise<void> {
   check('an expired key says so specifically', e?.errorMessage, 'This API key has expired.')
   check('and is also a USER_ERROR', e?.errorType, 'USER_ERROR')
 
-  // A USER_ERROR cannot self-heal. If it were offered for retry, a dead key
-  // would be re-sent every second forever.
-  const cursor = await fetchCursor(500)
-  const offered = new Set(cursor.retry.map((r) => r.signalId))
-  check('a USER_ERROR is never offered for auto-retry',
-    offered.has(unknown) || offered.has(expired), false)
+  // A USER_ERROR cannot self-heal, and the window WILL send it again — that is
+  // now unavoidable, since nothing here tracks what was already sent. So the rule
+  // has to hold on the settle side: re-receiving a USER_ERROR must be a no-op, or
+  // a dead key would be re-priced every minute forever.
+  const before = { unknown: (await statusOf(unknown))?.attemptCount, expired: (await statusOf(expired))?.attemptCount }
+  await dispatch()
+  check('re-sending a USER_ERROR does not advance its attempt count',
+    { unknown: (await statusOf(unknown))?.attemptCount, expired: (await statusOf(expired))?.attemptCount },
+    before)
+  check('and it stays a USER_ERROR rather than being retried into something else',
+    (await statusOf(unknown))?.errorType, 'USER_ERROR')
 }
 
 async function settleRejections(fx: Fixture): Promise<void> {
@@ -213,7 +219,7 @@ async function settleRejections(fx: Fixture): Promise<void> {
   check('all three passed the gate — the edge does not know the rulebook',
     [unknownCustomer, unknownModel, noType].every((s) => s !== null), true)
 
-  await sweepUntilQuiet()
+  await dispatch()
 
   if (unknownCustomer) {
     const c = await waitForStatus(unknownCustomer)
@@ -274,61 +280,54 @@ async function idempotency(settledSignalId: string | null): Promise<void> {
 async function retries(fx: Fixture): Promise<void> {
   heading('8 · retry policy: SERVER_ERROR comes back, USER_ERROR does not')
 
-  const planted = {
-    server: `e2e_${RUN}_server`,
-    user: `e2e_${RUN}_user`,
-    exhausted: `e2e_${RUN}_exhausted`,
-    gone: `e2e_${RUN}_gone_from_archive`,
-  }
-  const rows: [string, 'SERVER_ERROR' | 'USER_ERROR', number][] = [
-    [planted.server, 'SERVER_ERROR', 1],
-    [planted.user, 'USER_ERROR', 1],
-    [planted.exhausted, 'SERVER_ERROR', 5],
-    [planted.gone, 'SERVER_ERROR', 1],
-  ]
-  for (const [id, type, attempts] of rows) {
-    await db.exec(
-      `insert into "SignalStatus"
-         (id, "signalId", status, "errorType", "errorCode", "errorMessage",
-          "attemptCount", "receivedAt", "lastAttemptAt", "updatedAt")
-       values ($1, $2, 'PENDING', $3::"SignalErrorType", 'INTERNAL_ERROR', 'planted',
-               $4, now() - interval '1 hour', now() - interval '10 minutes', now())`,
-      [`e2e_st_${id}`, id, type, attempts],
-    )
-  }
+  // THIS SECTION CHANGED SHAPE WITH THE 1.0 DISPATCH MODEL.
+  //
+  // There is no retry list any more, and nothing on this side plants or reads a
+  // status row: the dispatcher re-sends EVERY signal in its window on every run
+  // and settle decides what to do with each one. So retry policy is no longer
+  // something this repo can be tested for in isolation — it is a property of the
+  // settle route, reachable only end to end. Which is what this does.
+  //
+  // The planted-status-row cases the old version used are gone with the cursor
+  // they fed: a row that exists only in Postgres is never sent now, because the
+  // dispatcher reads ClickHouse and nothing else.
 
-  const cursor = await fetchCursor(500)
-  const offered = new Set(cursor.retry.map((r) => r.signalId))
-  check('a SERVER_ERROR is offered for retry', offered.has(planted.server), true)
-  check('a USER_ERROR is not', offered.has(planted.user), false)
-  check(`one at attempt ${cursor.maxAttempts} is not`, offered.has(planted.exhausted), false)
-  check('the offer carries the NEXT attempt number',
-    cursor.retry.find((r) => r.signalId === planted.server)?.nextAttempt, 2)
-
-  // A retry the archive no longer holds must not wedge the sweep.
-  const swept = await sweepUntilQuiet(2)
-  check('a retry with no archive row does not break the sweep',
-    swept.every((o) => Number.isFinite(o.sent)), true)
-
-  // And a real one gets its attempt advanced, end to end.
   const real = await ingest(validBody(fx))
   if (!real) {
     check('SKIPPED — could not ingest a signal to retry', false, true)
     return
   }
-  await sweepUntilQuiet()
+  await dispatch()
+  const settled = await waitForStatus(real)
+  check('it settles once, at attempt 1',
+    { status: settled?.status, attempt: settled?.attemptCount },
+    { status: 'PROCESSED', attempt: 1 })
+
+  // Force it back to a retryable failure, the way a real settle-side outage
+  // would leave it.
   await db.exec(
     `update "SignalStatus"
         set status = 'PENDING', "errorType" = 'SERVER_ERROR', "errorCode" = 'INTERNAL_ERROR',
             "attemptCount" = 1, "lastAttemptAt" = now() - interval '10 minutes'
       where "signalId" = $1`, [real])
-  await sweepUntilQuiet()
+
+  // The next run's window still covers it, so it goes again with no prompting —
+  // this is the whole retry mechanism now.
+  await dispatch()
   const again = await statusOf(real)
-  check('a real retry is re-settled and its attempt advances to 2',
-    { status: again?.status, attempt: again?.attemptCount },
-    { status: 'PROCESSED', attempt: 2 })
+  check('an overlapping window re-sends a SERVER_ERROR and it is re-settled',
+    again?.status, 'PROCESSED')
   check('the retry did NOT create a second money row',
     await countIn('SignalLog', [real]), 1)
+
+  // And the counterpart rule, which is what stops the same overlap re-pricing
+  // everything forever: a signal that is already PROCESSED is a no-op on
+  // re-receipt.
+  const processedAttempt = (await statusOf(real))?.attemptCount
+  await dispatch()
+  check('re-sending a PROCESSED signal changes nothing',
+    { attempt: (await statusOf(real))?.attemptCount, money: await countIn('SignalLog', [real]) },
+    { attempt: processedAttempt, money: 1 })
 }
 
 async function spoofing(fx: Fixture): Promise<void> {
@@ -359,7 +358,7 @@ async function spoofing(fx: Fixture): Promise<void> {
   check('the forged receivedAt', signal?.receivedAt, toIso(row!.received_at))
   check('and the forged digest', signal?.apiKeyHash, KEY_HASH)
 
-  await sweepUntilQuiet()
+  await dispatch()
   const status = await waitForStatus(real)
   check('it settled under the real org, not the forged one', status?.organizationId, fx.orgId)
   check('no row exists for the forged id',
@@ -394,7 +393,7 @@ async function payloadFidelity(fx: Fixture): Promise<void> {
     'SELECT count() AS n FROM signal_log')
   check('and signal_log was not dropped', Number(stillThere[0]!.n) > 0, true)
 
-  await sweepUntilQuiet()
+  await dispatch()
   check('and it still settles', (await waitForStatus(signalId))?.status, 'PROCESSED')
 
   // A NUL byte on its own: Postgres text columns cannot hold one, so if any
@@ -402,7 +401,7 @@ async function payloadFidelity(fx: Fixture): Promise<void> {
   // SERVER_ERROR rather than a settled signal.
   const nulId = await ingest(validBody(fx, { custom: { nul: 'before after' } }))
   if (nulId) {
-    await sweepUntilQuiet()
+    await dispatch()
     const s = await waitForStatus(nulId)
     check('a NUL byte in the payload does not break settlement',
       s?.status === 'PROCESSED' || s?.errorType === 'USER_ERROR', true)
@@ -459,8 +458,6 @@ async function batchLimits(fx: Fixture): Promise<void> {
     body: '{}',
   })
   check('settle with the wrong shared secret is 401', badAuth.status, 401)
-  const cursorNoAuth = await fetch(`${PAYMENTS}/api/internal/signals/cursor`)
-  check('the cursor route is guarded too', cursorNoAuth.status, 401)
 }
 
 async function volume(fx: Fixture): Promise<void> {
@@ -486,27 +483,49 @@ async function volume(fx: Fixture): Promise<void> {
   }, { timeoutMs: 60_000 })
   check(`all ${N} reached the archive`, landed, true)
 
-  const sweeps = await sweepUntilQuiet(20)
+  const run = await dispatch()
   check(`all ${N} settled`,
     Number((await db.one<{ n: string }>(
       `select count(*) n from "SignalStatus"
         where "signalId" = any($1) and status = 'PROCESSED'`, [ids]))!.n), N)
   check(`exactly ${N} money rows — none duplicated, none lost`,
     await countIn('SignalLog', ids), N)
-  console.log(`        ${sweeps.length} sweeps; batch sizes ${sweeps.map((s) => s.sent).join(' + ')}`)
-  check('no sweep exceeded the configured concurrency',
-    sweeps.every((s) => s.batchIds.length <= config.dispatchConcurrency), true)
-  check('no sweep exceeded the configured batch size',
-    sweeps.every((s) => s.sent <= config.dispatchBatchSize * config.dispatchConcurrency), true)
+  // ONE run, ONE call. This is the 1.0 claim: the window goes in a single request
+  // whatever its size, so there is no batch count to assert and no concurrency to
+  // cap.
+  check(`all ${N} went in a single dispatch run`, run.sent >= N, true)
+  console.log(
+    `        1 run · sent ${run.sent} · ${run.bytes}B json -> ${run.gzipBytes}B gzip ` +
+    `(${(run.bytes / Math.max(run.gzipBytes, 1)).toFixed(1)}:1) · ${run.ms}ms`)
+  check('the body stayed well inside the 4.5MB request-body ceiling',
+    run.gzipBytes < 4.5 * 1024 * 1024, true)
 }
 
 async function convergence(): Promise<void> {
-  heading('13 · the sweep converges — a quiet pipeline stays quiet')
-  const first = await sweepUntilQuiet(4)
-  check('a caught-up pipeline sends nothing', first.at(-1)?.sent, 0)
-  const again = await sweepUntilQuiet(2)
-  check('and stays that way on the next sweep', again[0]?.sent, 0)
-  check('reporting no work rather than looping', again[0]?.saturated, false)
+  heading('13 · the overlap is free — re-sending the window changes nothing')
+
+  // The 1.0 design INVERTS the old invariant. A caught-up pipeline no longer
+  // sends nothing: the window is wider than the interval on purpose, so every run
+  // re-sends the same signals and that overlap is the entire error recovery.
+  //
+  // What has to hold instead is that the re-send is inert. If it were not, a
+  // caught-up pipeline would re-price its whole window every minute.
+  const moneyBefore = Number((await db.one<{ n: string }>(
+    `select count(*) n from "SignalLog"`))!.n)
+  const statusBefore = Number((await db.one<{ n: string }>(
+    `select count(*) n from "SignalStatus"`))!.n)
+
+  const first = await dispatch()
+  const second = await dispatch()
+  check('a caught-up window still sends its signals again, twice over',
+    first.sent > 0 && second.sent === first.sent, true)
+
+  check('and not one extra money row was written',
+    Number((await db.one<{ n: string }>(`select count(*) n from "SignalLog"`))!.n),
+    moneyBefore)
+  check('nor one extra status row',
+    Number((await db.one<{ n: string }>(`select count(*) n from "SignalStatus"`))!.n),
+    statusBefore)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

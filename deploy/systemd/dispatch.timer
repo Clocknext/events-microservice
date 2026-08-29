@@ -1,0 +1,20 @@
+# Fires dispatch.service every 60s.
+#
+# WHY A SYSTEMD TIMER AND NOT CRONTAB: systemd refuses to start a unit that is
+# already running, so two runs can never overlap. crontab would need `flock` to
+# get the same guarantee, and would fail open without it — two concurrent runs
+# would each send the same window.
+[Unit]
+Description=Run signal dispatch every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=1s
+# NOT persistent: after a reboot there is no backlog of missed ticks worth
+# firing. The window is time-based, so a missed tick's rows are covered by the
+# next run's overlap, and a catch-up storm would just re-send the same signals.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

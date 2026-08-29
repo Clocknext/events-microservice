@@ -1,13 +1,17 @@
-/** HTTP client for the payments app's internal endpoints — the only two things
- *  the dispatcher talks to besides ClickHouse.
+/** HTTP client for the payments app's internal settle route — the only thing the
+ *  dispatcher talks to besides ClickHouse.
  *
- *  Both authenticate the CALLER with the shared secret as
+ *  It authenticates the CALLER with the shared secret as
  *  `Authorization: Bearer <INTERNAL_SETTLE_SECRET>`; the `Bearer` scheme is
  *  required, a bare token is refused. No CUSTOMER credential is ever sent — the
  *  signal's `apiKeyHash` rides in the body and the payments app resolves the
  *  organisation from it, so the raw `cnk_…` key stays in the edge process. */
+import { gzip as gzipCb } from 'node:zlib'
+import { promisify } from 'node:util'
 import { config } from '../config.js'
-import type { CursorResponse, SettleResult, SettleSignal } from '../workers/dispatch/dispatch.schema.js'
+import type { SettleResult, SettleSignal, SettleTransfer } from '../workers/dispatch/dispatch.schema.js'
+
+const gzip = promisify(gzipCb)
 
 /** The payments app's public v1 envelope. */
 interface Envelope<T> {
@@ -16,16 +20,15 @@ interface Envelope<T> {
   result?: T
 }
 
-function authHeaders(): Record<string, string> {
-  return {
-    'content-type': 'application/json',
-    authorization: `Bearer ${config.internalSecret}`,
-  }
-}
-
 /** A non-200 that means "our shared secret is wrong", which never fixes itself
  *  by waiting and must not be mistaken for an outage. */
 export class MisconfiguredError extends Error {}
+
+/** The body exceeded what the platform will accept. Distinguished from a generic
+ *  failure because retrying it unchanged is pointless — the next window will be
+ *  at least as big — and the fix is a smaller `DISPATCH_WINDOW_MS` or, if gzip is
+ *  already on and still over, batching. */
+export class PayloadTooLargeError extends Error {}
 
 function readEnvelope<T>(status: number, body: string, route: string): T {
   let envelope: Envelope<T>
@@ -46,57 +49,62 @@ function readEnvelope<T>(status: number, body: string, route: string): T {
   return envelope.result
 }
 
-/** Asks what is left to do: the watermark, plus the signals due for a retry. */
-export async function fetchCursor(retryLimit: number): Promise<CursorResponse> {
-  const url = new URL('/api/internal/signals/cursor', config.paymentsUrl)
-  url.searchParams.set('retryLimit', String(retryLimit))
-  const res = await fetch(url, { headers: authHeaders() })
-  return readEnvelope<CursorResponse>(res.status, await res.text(), 'cursor')
-}
-
 /**
- * Asks which of these signals already has a status row.
+ * Settles the WHOLE window in one call and returns a result per signal.
  *
- * This is what keeps the overlap window from re-settling the same signals on
- * every sweep. An empty list short-circuits without a round trip.
- */
-export async function fetchKnown(signalIds: string[]): Promise<string[]> {
-  if (signalIds.length === 0) return []
-  const url = new URL('/api/internal/signals/known', config.paymentsUrl)
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify({ signalIds }),
-  })
-  return readEnvelope<{ known?: string[] }>(res.status, await res.text(), 'known').known ?? []
-}
-
-/**
- * Settles one batch and returns a result per signal.
+ * Throws on a transport failure or a non-200 — which the runner treats as "this
+ * window is unresolved". That is safe rather than lossy: the next run's window
+ * overlaps this one, so it sends the same signals again, and settle replays them
+ * onto the same money rows rather than charging twice (`SignalLog.signalId` is
+ * unique and is the idempotency key). Nothing needs to be recorded for that to
+ * work, which is the entire reason this process keeps no state.
  *
- * Throws on a transport failure or a non-200 — which the caller treats as "the
- * whole batch is unresolved, send it again". That is correct and safe: a settle
- * that never answered may still have committed some signals, and re-sending them
- * replays onto the same money rows rather than charging twice
- * (`SignalLog.signalId` is unique and is the idempotency key).
+ * THE BODY IS GZIPPED. Vercel caps a serverless function's request body at
+ * 4.5MB and raw signal JSON crosses that somewhere around 15k signals — well
+ * inside one window at production volume. Signal JSON is the same keys repeated
+ * thousands of times, so it compresses roughly 10:1 and the ceiling stops being
+ * the thing that decides the window width.
  */
-export async function settleBatch(
+export async function settleAll(
   batchId: string,
   signals: SettleSignal[],
-): Promise<SettleResult[]> {
+): Promise<SettleTransfer> {
   const url = new URL('/api/internal/settle', config.paymentsUrl)
+  const raw = Buffer.from(JSON.stringify({ batchId, signals }))
+  // Async gzip, not gzipSync: at 10k signals this is several MB, and blocking the
+  // only thread of a one-shot process for it buys nothing.
+  const body = config.dispatchGzip ? await gzip(raw) : raw
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    authorization: `Bearer ${config.internalSecret}`,
+  }
+  if (config.dispatchGzip) headers['content-encoding'] = 'gzip'
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify({ batchId, signals }),
-    // The route's own transaction budget runs to ~120s; wait past it so a batch
-    // that is still succeeding is not abandoned and replayed.
-    signal: AbortSignal.timeout(130_000),
+    headers,
+    body,
+    // Must sit ABOVE the route's own maxDuration. A settle call that is still
+    // committing must never be abandoned: the window would re-send work that in
+    // fact succeeded, and the run would report a failure that did not happen.
+    signal: AbortSignal.timeout(config.dispatchTimeoutMs),
   })
+
+  // 413 is its own class of failure: the body was refused before the route ran,
+  // so no signal was settled and re-sending the same window cannot help.
+  if (res.status === 413) {
+    throw new PayloadTooLargeError(
+      `settle refused a ${body.length}-byte body (${signals.length} signals, ` +
+        `gzip=${config.dispatchGzip}). Lower DISPATCH_WINDOW_MS, or if gzip is ` +
+        `already on, the window has outgrown a single call.`,
+    )
+  }
+
   const result = readEnvelope<{ signals?: SettleResult[] }>(
     res.status,
     await res.text(),
     'settle',
   )
-  return result.signals ?? []
+  return { results: result.signals ?? [], bytes: raw.length, gzipBytes: body.length }
 }

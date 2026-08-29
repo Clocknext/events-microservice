@@ -4,9 +4,10 @@ services:
   #   PLAINTEXT  localhost:9092  — the edge (`npm run dev`, on the host)
   #   INTERNAL   kafka:29092     — the ClickHouse container (Kafka table engine),
   #                                which cannot reach the host's localhost.
-  # Auto-topic-create is on with a single partition, so `signals` springs into
-  # being on first produce/consume. In prod this is MSK Serverless and the edge
-  # authenticates with IAM (KAFKA_USE_IAM=true) — see docs/PRODUCTION.md.
+  # Auto-topic-create is on, so `signals` springs into being on first
+  # produce/consume — but `scripts/up.sh` creates it explicitly anyway so the
+  # partition count is ours and not the broker default. In prod this is Kafka on
+  # the EC2 box with a public SASL_SSL listener — see docs/AWS-SETUP.md §4.
   kafka:
     container_name: kafka
     image: apache/kafka:3.9.0
@@ -22,7 +23,15 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      # One partition — signals go to the topic as-is, one ordered stream.
+      # ONE partition, matching production (docs/AWS-SETUP.md Step 0). Grow to 3
+      # only on a measured symptom — see that section for the two triggers.
+      #
+      # Growing is safe HERE (unlike most Kafka deployments) because nothing in
+      # this pipeline reads the topic in order: `signal_log` is
+      # ORDER BY (received_at, signal_id) and dedups on `signal_id`. The one real
+      # hazard is a new partition starting at the wrong offset, which
+      # `kafka_auto_offset_reset = 'earliest'` in 01-schema.sql already prevents.
+      # Never LOWER it — that is genuinely impossible.
       KAFKA_NUM_PARTITIONS: 1
       # Single broker: everything replicates once.
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1

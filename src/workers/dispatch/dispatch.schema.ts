@@ -1,15 +1,30 @@
 /** Types and ports for the dispatcher. A leaf — imports nothing else of ours.
  *
- *  The dispatcher is NOT part of the Fastify app (AGENTS.md): it is a separate
- *  long-lived process that reads the ClickHouse archive and posts batches to the
- *  payments app. Its two dependencies arrive as the narrow ports below, so the
- *  logic is a pure function over them and a test can hand it fakes. */
+ *  The dispatcher is NOT part of the Fastify app (AGENTS.md): it is a one-shot
+ *  process, run by a systemd timer every 60s, that reads one window of the
+ *  ClickHouse archive and posts it to the payments app in a single call. Its two
+ *  dependencies arrive as the narrow ports below, so the logic is a pure function
+ *  over them and a test can hand it fakes.
+ *
+ *  ─────────────────────────────────────────────────────────────────────────────
+ *  WHY THERE IS NO WATERMARK, NO CURSOR AND NO STATE OF ANY KIND
+ *
+ *  `/api/internal/settle` is idempotent on `signalId`: `SignalLog.signalId` is
+ *  UNIQUE and settle uses it as the idempotency key, so a signal sent twice
+ *  replays onto the original money row instead of charging again.
+ *
+ *  That one fact lets the run be stateless. It does not ask what it already sent;
+ *  it re-reads a window WIDER than the timer's interval and sends the lot, so
+ *  every signal goes about three times and settle discards the duplicates. The
+ *  overlap is not waste — it is the whole of the error recovery, since a run that
+ *  fails leaves nothing behind to resume from and is simply covered by the next
+ *  two.
+ *  ───────────────────────────────────────────────────────────────────────────── */
 
 // ─────────────────────────────────────────────────────────────────────────────
 // What ClickHouse holds
 
-/** One row of `signals.signal_log`, as the dispatcher selects it. `ingested_at`
- *  is deliberately not read — it is an ops column, not part of the signal. */
+/** One row of `signals.signal_log`, as the dispatcher selects it. */
 export interface SignalLogRow {
   signal_id: string
   /** ClickHouse renders DateTime64(3) as `YYYY-MM-DD hh:mm:ss.SSS` — a space,
@@ -23,18 +38,7 @@ export interface SignalLogRow {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// What the payments app says
-
-/** `GET /api/internal/signals/cursor` */
-export interface CursorResponse {
-  /** Newest `receivedAt` that has a status row — everything up to it has been
-   *  through settle at least once. Null when nothing has ever settled. */
-  sentThrough: string | null
-  /** Signals individually due for another attempt. Named rather than folded into
-   *  the watermark so one old failure cannot drag the sweep back with it. */
-  retry: { signalId: string; receivedAt: string; nextAttempt: number }[]
-  maxAttempts: number
-}
+// What the payments app wants
 
 /** One signal as `/api/internal/settle` wants it: the payload's own fields, plus
  *  the envelope fields the route reads, spread on top. */
@@ -43,8 +47,9 @@ export interface SettleSignal {
   receivedAt: string
   /** How the organisation is resolved. The raw key is never sent. */
   apiKeyHash: string
-  /** Which delivery this is. Settle stores it verbatim, so the count only
-   *  advances because the dispatcher advanced it. */
+  /** Always 1. Nothing on THIS side counts attempts any more — the dispatcher
+   *  keeps no state, so it cannot know which delivery this is. The attempt count
+   *  belongs to `SignalStatus`, which is the side that can actually see it. */
   attempt: number
   [payloadField: string]: unknown
 }
@@ -61,57 +66,74 @@ export interface SettleResult {
 // ─────────────────────────────────────────────────────────────────────────────
 // The ports
 
-/** One page of the archive.
+/** The window one run reads, over `ingested_at`.
  *
- *  `after` is a KEYSET cursor, not an offset. It exists because the sweep has to
- *  be able to page PAST rows it has already settled: the overlap window re-reads
- *  them, and if the SQL LIMIT is reached before the known-filter runs, every
- *  sweep reads the same page of known rows and never sees the new work behind
- *  them. That starves the pipeline permanently — see the test named for it. */
-export interface ArchivePage {
-  /** Lower bound from the watermark, already shifted back by the overlap. */
-  sinceIso: string | null
-  /** Exclusive keyset position, for page 2 onwards. Null for the first page. */
-  after: { receivedAt: string; signalId: string } | null
-  limit: number
+ *  Either a relative width (`windowMs`, the normal case) or an explicit
+ *  `[since, until)` for a manual replay. Never over `received_at` — see the
+ *  comment on `readIngested`. */
+export interface ArchiveWindow {
+  /** How far back from now, in ms. Ignored when `since` is set. */
+  windowMs: number
+  /** Explicit lower bound, ISO-8601. Empty in normal operation. */
+  since?: string | undefined
+  /** Explicit upper bound, ISO-8601, exclusive. Empty means "up to now". */
+  until?: string | undefined
+  /** Row ceiling. An OOM guard, not a batch size. */
+  cap: number
 }
 
 export interface ArchiveReader {
-  /** One page, oldest first, deduplicated on `signal_id`. */
-  readNewer(page: ArchivePage): Promise<SignalLogRow[]>
-  /** Rows for specific ids — how a retry gets its payload back. */
-  readByIds(signalIds: string[]): Promise<SignalLogRow[]>
+  /**
+   * Every row INGESTED in the window, oldest first, deduplicated on `signal_id`.
+   *
+   * The window is over `ingested_at` and never `received_at`. `received_at` is
+   * the caller's time, stamped by N edge instances off N clocks, and a row can
+   * land here minutes after it — the Kafka engine flushes in batches, and a
+   * broker backlog delays it further. A window over `received_at` would miss
+   * every such row PERMANENTLY, because nothing persists a watermark to come
+   * back for it. `ingested_at` is one clock on one server and means "arrived in
+   * the archive", which is what this run needs to mean by "the latest data".
+   */
+  readIngested(window: ArchiveWindow): Promise<SignalLogRow[]>
+}
+
+/** One settle call: its per-signal results, and how big the body actually was.
+ *
+ *  The sizes come back with the results rather than being measured again by the
+ *  caller, so the body is serialized exactly once. They are not decoration:
+ *  `gzipBytes` against Vercel's 4.5MB request-body ceiling is the number that
+ *  says how close this pipeline is to the limit that would force batching. */
+export interface SettleTransfer {
+  results: SettleResult[]
+  bytes: number
+  gzipBytes: number
 }
 
 export interface SettleClient {
-  cursor(retryLimit: number): Promise<CursorResponse>
-  /** Of these ids, which already have a status row? Bounded by what is asked, so
-   *  the answer never grows with traffic. */
-  known(signalIds: string[]): Promise<string[]>
-  settle(batchId: string, signals: SettleSignal[]): Promise<SettleResult[]>
+  /** Posts the WHOLE window in one call and returns a result per signal. */
+  settle(batchId: string, signals: SettleSignal[]): Promise<SettleTransfer>
 }
 
-/** What one sweep did. Returned rather than logged so a test can assert on it
- *  and the runner can decide whether to nap. */
-export interface SweepOutcome {
+/** What one run did. Returned rather than logged so a test can assert on it. */
+export interface RunOutcome {
   /** Rows read out of the archive. */
   read: number
-  /** Signals actually posted to settle (read, minus anything unusable). */
+  /** Signals actually posted (read, minus anything unusable). */
   sent: number
-  processed: number
-  /** Refused for good — the caller must change something. Not retried. */
-  userError: number
-  /** Ours. Retried on a later sweep until `maxAttempts`. */
-  serverError: number
   /** Rows the archive held but that could not be turned into a signal. */
   skipped: number
-  /** Candidates dropped because they had already been settled — the overlap
-   *  window doing its job without re-pricing anything. */
-  alreadyKnown: number
-  /** How many pages of the archive it had to read to fill the batch. >1 means
-   *  the overlap window held more settled rows than one page. */
-  pages: number
-  /** True when the batch came back full, i.e. there is probably more waiting. */
-  saturated: boolean
-  batchIds: string[]
+  processed: number
+  /** Refused for good — the caller must change something. Never retried. */
+  userError: number
+  /** Ours. Re-sent by the next overlapping window, and by the hourly
+   *  reconciliation run, for as long as those windows still cover it. */
+  serverError: number
+  /** True when the read hit `cap`, which means ROWS WERE LEFT UNSENT and the
+   *  next window has already moved past some of them. An alarm, not a state. */
+  capped: boolean
+  /** Uncompressed and on-the-wire body size, for watching the 4.5MB ceiling. */
+  bytes: number
+  gzipBytes: number
+  ms: number
+  batchId: string
 }

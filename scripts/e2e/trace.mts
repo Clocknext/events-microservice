@@ -9,11 +9,10 @@
  *   npm run trace
  */
 import './preload.mjs'
-import { config } from '../../src/config.js'
 import { toIso, toSettleSignal } from '../../src/workers/dispatch/dispatch.service.js'
-import { overlapFrom } from '../../src/workers/dispatch/dispatch.service.js'
-import { fetchCursor, fetchKnown } from '../../src/client/payments-client.js'
-import { archiveRow, clickhouse, env, PAYMENTS, postSignal, waitFor } from './harness.mjs'
+import { createArchiveReader } from '../../src/workers/dispatch/dispatch.archive.js'
+import { settleAll } from '../../src/client/payments-client.js'
+import { archiveRow, clickhouse, postSignal, waitFor } from './harness.mjs'
 import { db, KEY, remember, RUN, setup, teardown, type Fixture } from './fixtures.mjs'
 
 const rule = (n: string) => console.log(`\n\x1b[1m${'═'.repeat(76)}\n${n}\n${'═'.repeat(76)}\x1b[0m`)
@@ -55,47 +54,41 @@ async function main() {
     console.log(`toIso() restores the T and the Z:        ${toIso(row!.received_at)}`)
     console.log(`the edge stamped:                        ${res.json.result?.receivedAt}`)
 
-    // ── 3 · the cursor ─────────────────────────────────────────────────────
-    rule('3 · DISPATCHER ① — GET /api/internal/signals/cursor')
-    console.log(`GET ${PAYMENTS}/api/internal/signals/cursor?retryLimit=${config.dispatchBatchSize}`)
-    const cursor = await fetchCursor(config.dispatchBatchSize)
-    show('\nRESPONSE result', cursor)
-    const since = overlapFrom(cursor.sentThrough, 2_000)
-    console.log(`\nsentThrough                       ${cursor.sentThrough}`)
-    console.log(`minus the overlap window (2s here) ${since}`)
-    console.log('  → that lower bound is what the next query reads from.')
-
-    // ── 4 · the archive read ───────────────────────────────────────────────
-    rule('4 · DISPATCHER ② — the SELECT it runs against signal_log')
-    const sql = `SELECT signal_id, received_at, api_key_hash, payload
+    // ── 3 · the one archive read ───────────────────────────────────────────
+    rule('3 · DISPATCHER — the ONE SELECT it runs against signal_log')
+    console.log(`SELECT signal_id, received_at, api_key_hash, payload
    FROM signal_log
-  WHERE received_at > parseDateTime64BestEffort({since:String})
-  ORDER BY received_at ASC
+  WHERE ingested_at >= now64(3) - ({windowMs:UInt64} / 1000)
+  ORDER BY ingested_at ASC
   LIMIT 1 BY signal_id
-  LIMIT {limit:UInt32}`
-    console.log(sql)
-    console.log(`\nbound server-side:  since = ${since}   limit = ${config.dispatchBatchSize * config.dispatchConcurrency}`)
-    const candidates = await clickhouse.query<{ signal_id: string; received_at: string }>(sql, {
-      since: since ?? '1970-01-01T00:00:00.000Z',
-      limit: config.dispatchBatchSize * config.dispatchConcurrency,
-    })
-    console.log(`\n→ ${candidates.length} candidate row(s)`)
+  LIMIT {cap:UInt32}`)
+    console.log(`
+  THE WINDOW IS OVER ingested_at, NOT received_at, and that is the whole trick.
+
+  received_at is the CALLER's time, stamped by N edge instances off N clocks. A
+  row can land here minutes after it — the Kafka engine flushes in batches, and a
+  broker backlog delays it further. Nothing persists a watermark, so a window over
+  received_at would miss such a row permanently. ingested_at is DEFAULT now64(3):
+  one clock, one server, "arrived in the archive".
+
+  The lower bound is computed by CLICKHOUSE, from its own now64(3), not by the
+  dispatcher — comparing against a bound off this machine's clock would shift the
+  window by whatever skew exists between the two, silently.
+
+  There is NO upper bound, so consecutive runs overlap and nothing falls between
+  them. received_at is still what settle bills on.`)
+
+    const archive = createArchiveReader(clickhouse)
+    const window = { windowMs: 90_000, cap: 1_000 }
+    const candidates = await archive.readIngested(window)
+    console.log(`\n→ ${candidates.length} row(s) in the last ${window.windowMs / 1000}s of INGESTION`)
     for (const c of candidates.slice(0, 5)) console.log(`   ${c.signal_id}  ${c.received_at}`)
+    console.log(`   ${candidates.some((c) => c.signal_id === signalId) ? '✓' : '✗'} our signal is in the window`)
     console.log(`
   LIMIT 1 BY signal_id collapses the duplicates at-least-once Kafka delivery
-  leaves in a ReplacingMergeTree before a merge runs. Cheaper than FINAL, and it
-  is what stops one physical duplicate being settled twice.`)
-
-    // ── 5 · the known filter ───────────────────────────────────────────────
-    rule('5 · DISPATCHER ③ — POST /api/internal/signals/known')
-    const ids = candidates.map((c) => c.signal_id)
-    show('REQUEST', { signalIds: ids.slice(0, 5).concat(ids.length > 5 ? ['…'] : []) })
-    const known = await fetchKnown(ids)
-    show('\nRESPONSE result', { known })
-    console.log(`\n${ids.length} candidates − ${known.length} already recorded = ${ids.length - known.length} to send`)
-    console.log(`
-  Without this the overlap window would re-send every signal inside it on every
-  sweep — correct (settle dedups) but the pipeline would never go quiet.`)
+  leaves in a ReplacingMergeTree before a merge runs. Cheaper than FINAL. Note it
+  is a DIFFERENT job from settle's idempotency: that dedups across runs, this
+  stops one request body carrying the same signal twice.`)
 
     // ── 6 · the settle call ────────────────────────────────────────────────
     rule('6 · DISPATCHER ④ — POST /api/internal/settle')
@@ -103,17 +96,20 @@ async function main() {
     console.log('toSettleSignal() spreads the payload, then writes the envelope over it,')
     console.log('and DELETES organizationId — the payload is caller-controlled.\n')
     const payload = { batchId: `trace_${RUN}`, signals: [settleSignal] }
-    show('REQUEST BODY', payload)
+    show('REQUEST BODY (before encoding)', payload)
+    console.log(`
+  The real client sends this GZIPPED, with content-encoding: gzip. Not an
+  optimisation — Vercel refuses a serverless function's request body over 4.5MB,
+  and one window of raw signal JSON crosses that at roughly 15k signals. Signal
+  JSON is the same keys over and over, so it compresses about 10:1.
 
-    const settleRes = await fetch(`${PAYMENTS}/api/internal/settle`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${env.internalSecret}` },
-      body: JSON.stringify(payload),
-    })
-    const settleBody = JSON.parse(await settleRes.text()) as Record<string, unknown>
+  The WHOLE window goes in ONE call. There is no batch size and no concurrency.`)
+
+    const transfer = await settleAll(`trace_${RUN}`, [settleSignal!])
     rule('7 · WHAT /api/internal/settle RETURNS  (verbatim, nothing elided)')
-    console.log(`HTTP ${settleRes.status}`)
-    show('', settleBody)
+    console.log(`body: ${transfer.bytes}B json -> ${transfer.gzipBytes}B on the wire ` +
+      `(${(transfer.bytes / Math.max(transfer.gzipBytes, 1)).toFixed(1)}:1)`)
+    show('', transfer.results)
 
     // ── 8 · the rows ───────────────────────────────────────────────────────
     rule('8 · POSTGRES — the two rows it wrote')
@@ -130,14 +126,21 @@ async function main() {
               "customerCost", "receivedAt", "idempotencyKey", status
          from "SignalLog" where "signalId" = $1`, [signalId]))
 
-    // ── 9 · convergence ────────────────────────────────────────────────────
-    rule('9 · THE NEXT SWEEP — the pipeline goes quiet')
-    const cursor2 = await fetchCursor(config.dispatchBatchSize)
-    console.log(`cursor.sentThrough is now  ${cursor2.sentThrough}`)
-    const known2 = await fetchKnown([signalId])
-    console.log(`known([${signalId}])  →  ${JSON.stringify(known2)}`)
-    console.log('\n  The signal is inside the overlap window and WILL be re-read, but it is')
-    console.log('  now "known", so it is dropped before settle. That is convergence.')
+    // ── 9 · the overlap ────────────────────────────────────────────────────
+    rule('9 · THE NEXT RUN — it sends the same signal AGAIN, on purpose')
+    const again = await archive.readIngested(window)
+    const stillThere = again.some((c) => c.signal_id === signalId)
+    console.log(`the same window still holds our signal: ${stillThere}`)
+    console.log(`
+  It does, and the next run WILL send it again. Nothing here filters it, because
+  nothing here remembers that it was sent — there is no watermark, no cursor and
+  no status lookup left in this process.
+
+  That is not a leak, it is the error recovery. The window is 3x the timer's
+  interval, so a run that fails is covered by the next two, and settle collapses
+  the duplicates onto the same money row (SignalLog.signalId is UNIQUE and is the
+  idempotency key). The row above is the proof: sent twice, charged once.`)
+
   } finally {
     try {
       await teardown(fixture)

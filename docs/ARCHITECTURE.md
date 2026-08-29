@@ -30,15 +30,14 @@ while building it; [PRODUCTION.md](PRODUCTION.md) is the AWS wiring.
                         │         │                                   │
                         │         │ read-only                         │
                         │  ┌──────────────┐                           │
-                        │  │  DISPATCHER  │  loop: cursor → read →    │
-                        │  └──────────────┘         known → settle    │
+                        │  │  DISPATCHER  │  one-shot, 60s timer:     │
+                        │  │  (one-shot)  │  read window → settle     │
+                        │  └──────────────┘  → exit                   │
                         └─────────┼───────────────────────────────────┘
-                                  │  HTTPS + shared secret
+                                  │  HTTPS + shared secret, gzipped
                         ┌─────────▼───────────────────────────────────┐
                         │  PAYMENTS APP (Clocknext-Payment-Saas)      │
                         │                                             │
-                        │  /api/internal/signals/cursor   what's left │
-                        │  /api/internal/signals/known    already done│
                         │  /api/internal/settle           price it    │
                         │                    │                        │
                         │                    ▼                        │
@@ -77,13 +76,16 @@ signal is archived, then refused downstream with a recorded reason.
 
 | Route | Method | Purpose | Returns |
 | --- | --- | --- | --- |
-| `/api/internal/signals/cursor` | GET | what is still outstanding | `{ sentThrough, retry[], maxAttempts }` |
-| `/api/internal/signals/known` | POST | of these ids, which are recorded | `{ known[] }` |
-| `/api/internal/settle` | POST | price a batch of ≤500 | `{ batchId, total, processed, pending, unattributed, workers, workerCount, batchConcurrency, wallMs, recorded, signals[] }` |
+| `/api/internal/settle` | POST | price one window, whatever its size | `{ batchId, total, processed, pending, unattributed, workers, workerCount, batchConcurrency, wallMs, recorded, signals[] }` |
 | `/api/internal/resolve` | POST | single-key resolution (pre-existing) | `{ apiKey }` |
 
-All four answer `401 Unauthorized.` without the shared secret. The `Bearer`
-scheme is required — a bare token is refused.
+Both answer `401 Unauthorized.` without the shared secret. The `Bearer` scheme is
+required — a bare token is refused.
+
+**`/api/internal/signals/cursor` and `/api/internal/signals/known` are gone from
+this side.** They existed to answer "what have I already sent?", which the 1.0
+dispatcher never asks: it keeps no state, re-sends a whole time window every run,
+and lets settle discard the duplicates.
 
 ---
 
@@ -128,36 +130,52 @@ immediate, every read uses `LIMIT 1 BY signal_id`.
 
 *Measured: 55 signals landed in ~518 ms; a single signal in ~263 ms.*
 
-### Hop 3 · The dispatcher sweep
+### Hop 3 · The dispatch run
 
 ```
-① GET  cursor    → sentThrough (watermark) + retry[] (named individually)
-② read retries by id            ← oldest work, cannot be crowded out
-③ read newer WHERE received_at > sentThrough − DISPATCH_OVERLAP_MS
-④ POST known    → drop anything already recorded
-   ③+④ repeat with a keyset cursor until the batch is full or the archive ends
-⑤ POST settle   × ceil(n/500), at most DISPATCH_CONCURRENCY in flight
+① SELECT … FROM signal_log WHERE ingested_at >= now64(3) − DISPATCH_WINDOW_MS
+                           ORDER BY ingested_at ASC LIMIT 1 BY signal_id
+② map rows → settle signals (envelope written over the payload)
+③ POST settle   ONCE, gzipped, carrying all of them
+④ exit 0 / 1 / 2
 ```
 
-**Why ③ reads backwards.** ClickHouse's Kafka engine flushes in batches and
-several edge instances stamp `receivedAt` from their own clocks, so a row can
-appear *below* a timestamp already seen. Read strictly forward and it is lost
-silently, forever.
+**Why `ingested_at` and not `received_at`.** `received_at` is the caller's time,
+stamped by N edge instances off N clocks, and ClickHouse's Kafka engine flushes in
+batches — so a row can land in the archive minutes after its `received_at`. With
+no watermark anywhere in this design, a window over `received_at` skips that row
+**permanently and silently**. `ingested_at` is `DEFAULT now64(3)`: one clock, one
+server, "arrived in the archive". `received_at` is still what settle bills on.
 
-**Why ④ exists.** Without it, ③ re-sends its whole window every sweep. Harmless
-(settle dedups) and ruinous — the pipeline never goes idle.
+**Why the bound is `now64(3)` and not the dispatcher's clock.** `ingested_at` is
+stamped by ClickHouse, so the comparison has to be made against ClickHouse's own
+clock or the window shifts by whatever skew exists between two machines.
 
-**Why ③ and ④ loop.** The filter runs after the SQL `LIMIT`, so a window holding
-more settled rows than one page would be read, discarded entirely, and the new
-work behind it never reached — a permanent stall (FINDINGS BUG-7). The keyset
-cursor `(received_at, signal_id)` walks past them.
+**Why there is no upper bound, and no filter.** The window runs to this instant
+and is 3× the timer's interval, so consecutive runs overlap heavily and every
+signal is sent about three times. That is the *entire* error-recovery mechanism:
+nothing is persisted, so a failed run has nothing to resume — and needs nothing,
+because the next two read exactly the same rows. Settle collapses the duplicates
+onto the same money row.
 
-*Measured, 55 outstanding signals:*
+**Why `LIMIT 1 BY signal_id` is still there.** It dedups *within* one run, so a
+pre-merge `ReplacingMergeTree` duplicate does not put the same signal in one
+request body twice. Settle's idempotency is the across-runs half of the job.
+
+**Why `ingested_at` needs an index.** It is neither the `ORDER BY` key
+(`received_at, signal_id`) nor the partition key, so the window would otherwise be
+a full scan of every partition reading the fat `payload` column — hence the
+`minmax` skip index in migration `002`.
+
+*Two consecutive runs, same 55 signals:*
 
 ```
-sweep 1  read=55  sent=55  processed=46  userError=9  alreadyKnown=0   batches=1
-sweep 2  read=0   sent=0   processed=0   userError=0  alreadyKnown=55  batches=0
+dispatch.run  read=55  sent=55  processed=46  userError=9  capped=false
+dispatch.run  read=55  sent=55  processed=0   userError=9  capped=false
 ```
+
+The second run re-sends everything and moves no money. That is convergence here —
+not an idle pipeline, but an inert re-send.
 
 ### Hop 4 · Settle
 
@@ -305,10 +323,13 @@ dispatchers running at once are safe rather than a corruption bug.
 ### Convergence
 
 ```
-a fresh sweep now sends       0
-candidates dropped as known   55
-cursor.retry                  0 signal(s) due
+a fresh run sends again       55
+money rows before / after     55 / 55
 ```
+
+Convergence in this design is not a pipeline that goes idle — it cannot, since the
+window is wider than the interval and nothing filters it. It is a re-send that
+moves no money.
 
 ---
 
@@ -318,16 +339,18 @@ cursor.retry                  0 signal(s) due
 | --- | --- | --- | --- |
 | Kafka unreachable at produce | **502** `QUEUE_UNAVAILABLE` | nothing written | caller retries |
 | `KAFKA_BROKERS` unset | 202 | nothing produced | 202 means only "passed the gate" |
-| ClickHouse behind on ingest | 202 already sent | rows arrive late | the overlap window catches them |
-| ClickHouse down | 202 already sent | Kafka retains 7 days | sweep errors, backs off 1→30 s, resumes |
+| ClickHouse behind on ingest | 202 already sent | rows arrive late | harmless — the window is over `ingested_at`, so a late row is simply in a later window |
+| ClickHouse down | 202 already sent | Kafka retains 7 days | run exits 1; the next tick retries. No backoff needed — the timer *is* the backoff |
 | ClickHouse rebuilt from scratch | — | replay the topic | offsets reset; `signal_log` is derived, never authoritative |
-| cursor route down | — | nothing swept | sweep errors, backs off, resumes |
-| settle 5xx / timeout | — | **no status rows for that batch** | next sweep re-sends; safe because settle dedups |
-| settle returns `SERVER_ERROR` | — | `PENDING` + reason | retried at 30 s intervals to attempt 5, then left with its error |
+| settle 5xx / timeout | — | **no status rows for that window** | run exits 1; the next window overlaps it and re-sends. Safe because settle dedups |
+| settle returns `SERVER_ERROR` | — | `PENDING` + reason | re-sent by every overlapping run, then hourly by reconciliation. Settle decides whether to re-process |
 | settle returns `USER_ERROR` | — | `PENDING` + reason | **never** auto-retried — waits for a fix |
 | a status row fails to write | — | money is committed, lifecycle is not | `recorded.failed > 0`; signal is re-sent and re-recorded |
-| shared secret wrong | — | nothing | dispatcher raises `MisconfiguredError` and **exits** rather than looping |
-| dispatcher killed mid-batch | — | that batch's outcomes unrecorded | next sweep re-sends them |
+| shared secret wrong | — | nothing | **exit 2**, so a timer's failure count shows it instead of a 401 every minute |
+| dispatcher killed mid-call | — | that window's outcomes unrecorded | next window re-sends them |
+| three consecutive runs fail | — | those rows leave the 3-min window | the **hourly reconciliation** (2-hour window) is the only thing that covers this |
+| body over 4.5MB | — | nothing settled | **exit 2** on 413; lower `DISPATCH_WINDOW_MS` |
+| window over `DISPATCH_MAX_ROWS` | — | **rows not sent** | `run.capped` logged; reconciliation covers ≤2h, else `DISPATCH_SINCE` |
 | two dispatchers running | — | some duplicate sends | harmless; settle dedups |
 
 The asymmetry is deliberate: **the ingest path fails closed** (a signal that
@@ -371,10 +394,9 @@ is why the split exists, not style.
 
 | Lever | Now | Effect |
 | --- | --- | --- |
-| Kafka partitions | **1** | ⚠️ one consumer of order, no HA, head-of-line blocking |
-| `DISPATCH_BATCH_SIZE` | 500 | settle's enforced cap. Raising it buys **nothing** |
-| `DISPATCH_CONCURRENCY` | 2 | the real throughput lever |
-| `DISPATCH_OVERLAP_MS` | 60 000 | keep tight — every settled row inside it is paged past on each sweep |
+| Kafka partitions | **1** | consumer ceiling 1. Grow to 3 on a measured symptom — §8 below |
+| `DISPATCH_WINDOW_MS` | 180 000 | 3× the timer's interval. Wider = more duplicate sends; narrower = less recovery |
+| `DISPATCH_MAX_ROWS` | 100 000 | memory ceiling. Hitting it **loses rows** — it is not a throughput knob |
 | `INTERNAL_WORKER` | 5 | workers inside one settle call |
 | `INTERNAL_BATCH_CONCURRENCY` | 4 | concurrent batches settle will accept |
 
@@ -386,43 +408,57 @@ finish inside the function budget can never succeed at all.
 
 Connection ceiling: `INTERNAL_BATCH_CONCURRENCY × INTERNAL_WORKER` = 20.
 
-**The one partition is the open decision.** Repartitioning later moves
-key→partition placement, so pick the number before production — 12, keyed by
-`customerId` as it already is, costs nothing on MSK.
+**One partition, growing to 3 on a symptom.** The two triggers, both measurable:
+ClickHouse ingestion falling behind the produce rate (one partition caps you at
+one consumer), or head-of-line blocking from a slow/oversized message. Neither is
+speculative work to do up front — at peak (~4 MB/s for ~2 s) one partition is
+ample.
+
+**Growing is cheap in this pipeline**, which is worth stating because the usual
+Kafka advice says otherwise. Adding partitions does rehash
+`customerId`→partition and does split a customer's ordered stream; it costs
+nothing here because nothing reads the topic in order. The MV inserts into
+`signal_log` (`ORDER BY (received_at, signal_id)`, dedup on `signal_id`), the
+dispatcher windows on `ingested_at` and bills on `received_at`, and settle is
+idempotent on `signalId`. No stateful per-customer aggregation exists.
+
+**The one real precondition** is `kafka_auto_offset_reset = 'earliest'` on
+`kafka_signals` (migration `003`). A new partition has no committed offset, so
+librdkafka's default `latest` would skip whatever the producer wrote to it before
+the consumer rebalanced onto it — permanently, with no watermark to recover from.
+Set before growing, it costs nothing.
+
+Growing is then one command:
+`kafka-topics.sh --alter --topic signals --partitions 3`. Lowering the count
+remains impossible.
 
 ---
 
 ## 9 · Starting the dispatcher for the first time
 
-The watermark is `max(receivedAt)` over `SignalStatus`. With that table empty,
-**every unsettled row in the archive is outstanding**, so the first run sweeps
-the whole thing.
+**There is nothing to do, and that is the point.** The old model derived its
+starting position from `max(receivedAt)` over `SignalStatus`, so an empty table
+meant *every* archived row was outstanding and a first start against a
+17,033-row archive swept all of them — safely, since they carried no
+`api_key_hash` and every one came back `USER_ERROR` with no money moved, but it
+wrote 17,033 status rows nobody asked for. That is why a cold-start guard and a
+"park the watermark at now" incantation existed.
 
-That is correct, and it is exactly what you want when adopting the dispatcher is
-meant to backfill. It is a surprise when the archive predates it. Observed here:
-a first start against a 17,033-row archive swept all of them — safely, since they
-carried no `api_key_hash` and every one came back `USER_ERROR` with no money
-moved, but it wrote 17,033 status rows nobody asked for.
+A time window has no such failure mode. The first run reads the last
+`DISPATCH_WINDOW_MS` of *ingestion* and nothing older, whatever Postgres does or
+does not contain. So:
 
-`npm run up` warns when the archive is non-empty and prints the alternative:
-park the watermark at *now* before starting, so only new signals are picked up.
+- the cold-start guard is gone, along with `DISPATCH_COLD_START_MAX`
+- there is no watermark row to plant before starting
+- a deliberate backfill is now an explicit, bounded request rather than an
+  accident of an empty table:
 
 ```bash
-psql "${DATABASE_URL%%\?*}" -c "insert into \"SignalStatus\"
-  (id, \"signalId\", status, \"attemptCount\", \"receivedAt\", \"updatedAt\")
-  values ('watermark_'||gen_random_uuid(), 'watermark_'||gen_random_uuid(),
-          'PROCESSED', 1, now(), now())"
+DISPATCH_SINCE=2026-08-01T00:00:00Z DISPATCH_UNTIL=2026-08-02T00:00:00Z \
+DISPATCH_MAX_ROWS=1000000 npm run dispatch
 ```
 
-That same first run is also the best evidence the keyset paging works under load:
-
-```
-sweep  read=1000 sent=1000 alreadyKnown=15998 pages=17 saturated=true
-```
-
-Seventeen pages walked past ~16k already-settled rows to reach the 1000 that
-still needed doing. Before the BUG-7 fix that sweep would have returned nothing,
-forever.
+A malformed bound exits 2 rather than reading a window nobody asked for.
 
 ## 10 · Reproducing this
 

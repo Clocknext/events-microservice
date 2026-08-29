@@ -1,0 +1,40 @@
+# THE SAFETY NET. Same binary, same code path, a much wider window.
+#
+# The 1-minute run's 3-minute window covers any SINGLE failed tick, because the
+# next two runs re-send the same signals. What it cannot cover is three
+# consecutive failures — settle down for five minutes, a ClickHouse restart —
+# because nothing is persisted to recover from. Those rows fall out of the window
+# and are never sent again.
+#
+# So this runs hourly over two hours of ingestion. It re-sends an hour of already
+# settled signals every hour and settle discards all of them, which costs
+# bandwidth and nothing else (it is idempotent on signalId). That is the whole
+# price of not needing a watermark.
+[Unit]
+Description=Signal dispatch reconciliation — a 2-hour window, hourly
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dispatch
+Group=dispatch
+WorkingDirectory=/srv/events-microservice
+EnvironmentFile=/srv/events-microservice/.env
+
+# Environment= is applied AFTER EnvironmentFile=, so this wins over whatever
+# .env says. Two hours of ingestion, and a cap raised to match — the default
+# 100k would be hit by two hours of traffic that one minute clears easily.
+Environment=DISPATCH_WINDOW_MS=7200000
+Environment=DISPATCH_MAX_ROWS=500000
+
+ExecStart=/usr/bin/node --max-old-space-size=2048 dist/workers/dispatch/dispatch.runner.js
+TimeoutStartSec=900
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

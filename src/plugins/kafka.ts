@@ -70,8 +70,14 @@ export default fp(
       async send(message: SignalMessage) {
         await producer.send({
           topic: config.kafkaTopic,
-          // Key by customer so one customer's signals keep their order on a
-          // single partition.
+          // Key by customer: Kafka hashes the key, so all of one customer's
+          // signals land on the same partition. The topic is on ONE partition
+          // today, so this is currently a no-op — it is here so that growing the
+          // topic later keeps a customer's signals together without a code
+          // change.
+          //
+          // Nothing downstream actually depends on that ordering: `signal_log`
+          // is ORDER BY (received_at, signal_id) and dedups on `signal_id`.
           messages: [{ key: message.body.customerId, value: JSON.stringify(message) }],
         })
       },

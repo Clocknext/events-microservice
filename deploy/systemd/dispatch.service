@@ -1,0 +1,40 @@
+# The 1-minute dispatch run. ONE-SHOT: it reads one window of the ClickHouse
+# archive, posts all of it to /api/internal/settle in a single call, and exits.
+#
+# Started by dispatch.timer, never enabled directly.
+[Unit]
+Description=Signal dispatch — one window to /api/internal/settle
+Documentation=file:///srv/events-microservice/docs/IMPLEMENTATION.md
+# The run reads ClickHouse over HTTP; without this a boot-time tick can fail
+# once for no better reason than DNS not being up yet.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dispatch
+Group=dispatch
+WorkingDirectory=/srv/events-microservice
+
+# LOAD-BEARING. `.env` is read by the npm scripts (--env-file-if-exists), never
+# by the code — src/config.ts only ever reads process.env. Invoke node directly
+# without this and the process gets no configuration at all: no
+# INTERNAL_SETTLE_SECRET, so it exits 2 every minute.
+EnvironmentFile=/srv/events-microservice/.env
+
+# `dist`, not tsx: tsx type-strips the whole graph on every start, and this
+# starts 1,440 times a day.
+ExecStart=/usr/bin/node dist/workers/dispatch/dispatch.runner.js
+
+# Above DISPATCH_TIMEOUT_MS (310s), so systemd never kills a settle call that is
+# still committing — the window would then re-send work that actually succeeded.
+TimeoutStartSec=330
+
+# One JSON line per run, to journald. `journalctl -u dispatch -f` is the log.
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

@@ -58,44 +58,51 @@ export const config = {
    *  `/api/internal/settle` and `/api/internal/signals/cursor` require it. */
   internalSecret: process.env.INTERNAL_SETTLE_SECRET ?? '',
 
-  // --- the dispatcher --------------------------------------------------------
-  /** Signals per settle call. 500 is the route's own enforced cap. A bigger
-   *  batch buys NO throughput — settle splits it across `INTERNAL_WORKER`
-   *  workers that each walk their chunk one signal at a time — it only lengthens
-   *  the wall time and worsens a timeout. */
-  dispatchBatchSize: intFromEnv('DISPATCH_BATCH_SIZE', 500),
-  /** Settle calls in flight at once. Throughput scales here, not on batch size.
-   *  Keep at or below the payments app's `INTERNAL_BATCH_CONCURRENCY`, or the
-   *  extra batches only queue for a pool slot. */
-  dispatchConcurrency: intFromEnv('DISPATCH_CONCURRENCY', 2),
-  /** Nap when a sweep came back short. A FULL batch loops again immediately, so
-   *  this is the idle cost, never the throughput ceiling. */
-  dispatchIdleMs: intFromEnv('DISPATCH_IDLE_MS', 1000),
-  /** How far behind the watermark to re-read. ClickHouse's Kafka engine flushes
-   *  in batches, and several edge instances stamp `receivedAt` off their own
-   *  clocks, so a row can appear with a timestamp just below one already seen.
-   *  Re-reading this window catches it.
+  // --- the dispatcher (the 1-minute cron) -------------------------------------
+  //
+  // Dispatch is a ONE-SHOT process on a timer, not a loop: it reads one window of
+  // the archive, posts it to /api/internal/settle in a single call, and exits.
+  // There is no watermark, no cursor, no claim and no local state — settle is
+  // idempotent on `signalId`, so windows are allowed to overlap and the duplicates
+  // are discarded upstream. See docs/IMPLEMENTATION.md.
+  /** How far back the window reaches, over `ingested_at`.
    *
-   *  Keep it TIGHT. Every settled row inside the window is re-read on every
-   *  sweep and then discarded by the known-filter, so the sweep has to page past
-   *  them to reach new work; a window far wider than the batch size makes that
-   *  paging the dominant cost. 60s comfortably covers a 7.5s flush interval and
-   *  any NTP-synced clock skew. Widen it only if rows are demonstrably arriving
-   *  later than that, and watch for `sweep.page_cap` in the log. */
-  dispatchOverlapMs: intFromEnv('DISPATCH_OVERLAP_MS', 60 * 1000),
-  /** Cold-start guard, in signals.
+   *  Deliberately WIDER than the timer's interval — at the default, 3x. That
+   *  overlap is the entire error recovery: a run that fails is covered by the next
+   *  two, with nothing persisted to recover from. Every signal is therefore sent
+   *  about three times and settle throws away all but the first.
    *
-   *  The watermark is `max(receivedAt)` over `SignalStatus`. When that table is
-   *  empty there is no watermark, so EVERY unsettled row in the archive counts as
-   *  outstanding and the first run backfills the lot. That is right when the
-   *  archive is new or the backfill is wanted, and badly wrong when the archive
-   *  predates the dispatcher — the difference is a judgement nobody can make from
-   *  inside a loop.
+   *  The window is over `ingested_at` and never `received_at`: `received_at` is
+   *  the caller's time, stamped by N edge instances off N clocks, and a row can
+   *  land here minutes later — a window over it would miss that row for good.
+   *  `received_at` is still what settle bills on. */
+  dispatchWindowMs: intFromEnv('DISPATCH_WINDOW_MS', 3 * 60 * 1000),
+  /** Hard ceiling on rows per run. An OOM GUARD, not a batch size — the whole
+   *  window goes to settle in one call, so this bounds only how much a single run
+   *  will hold in memory (~150MB of Node heap at the default).
    *
-   *  So: on a cold start, refuse if the archive is bigger than this and say what
-   *  the choices are. Set to 0 to allow any size (the deliberate-backfill case).
-   *  Once anything has settled there is a watermark and the guard never fires. */
-  dispatchColdStartMax: intFromEnv('DISPATCH_COLD_START_MAX', 1000),
+   *  Hitting it MEANS ROWS WERE NOT SENT: the next window has already moved past
+   *  some of them, so the run logs at error level and must page someone. The
+   *  hourly reconciliation timer covers up to two hours of that; past it, replay
+   *  with DISPATCH_SINCE. Raise it only alongside --max-old-space-size. */
+  dispatchMaxRows: intFromEnv('DISPATCH_MAX_ROWS', 100_000),
+  /** Timeout on the one settle call, in ms. Must sit ABOVE the settle route's own
+   *  maxDuration: a call that is still committing must never be abandoned, or the
+   *  next window re-sends work that in fact succeeded. */
+  dispatchTimeoutMs: intFromEnv('DISPATCH_TIMEOUT_MS', 310_000),
+  /** gzip the settle request body. On by default, and effectively required:
+   *  Vercel caps a serverless function's request body at 4.5MB, which raw JSON
+   *  crosses somewhere around 15k signals. Signal JSON is the same keys repeated
+   *  thousands of times, so it compresses roughly 10:1. Off only for debugging
+   *  against a server that does not decompress. */
+  dispatchGzip: (process.env.DISPATCH_GZIP ?? 'true').toLowerCase() !== 'false',
+  /** Manual replay window, ISO-8601, both optional and both empty in normal
+   *  operation. Set them and the run ignores DISPATCH_WINDOW_MS and reads exactly
+   *  [since, until) over `ingested_at` instead — which is how a gap left by an
+   *  outage longer than the reconciliation window gets filled, without a
+   *  code change or a cursor to rewind. */
+  dispatchSince: process.env.DISPATCH_SINCE ?? '',
+  dispatchUntil: process.env.DISPATCH_UNTIL ?? '',
 
   // --- request limits --------------------------------------------------------
   /** Reject bodies over this size (Fastify bodyLimit -> 413). */

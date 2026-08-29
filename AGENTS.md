@@ -15,7 +15,7 @@ goes, not what it means.
 | | Entry point | What it is |
 | --- | --- | --- |
 | **the edge** | `src/server.ts` | a Fastify service. `POST /api/v1/signal` — gate, stamp, produce to Kafka, 202 |
-| **the dispatcher** | `src/workers/dispatch/dispatch.runner.ts` | a long-lived loop. Reads the ClickHouse archive, posts batches to the payments app |
+| **the dispatcher** | `src/workers/dispatch/dispatch.runner.ts` | a ONE-SHOT on a 60s timer. Reads one window of the ClickHouse archive, posts all of it to the payments app in a single call, exits |
 
 They share `config.ts` and nothing else. The dispatcher imports **no plugin and
 no Fastify**; the edge imports **nothing under `client/`**. Keep it that way — the
@@ -48,9 +48,9 @@ root
     │   └── payments-client.ts   cursor / known / settle
     ├── workers/dispatch/        the dispatcher process
     │   ├── dispatch.schema.ts   ports + row types (a leaf)
-    │   ├── dispatch.service.ts  sweepOnce() — a pure function over the ports
-    │   ├── dispatch.archive.ts  the two SELECTs against signal_log
-    │   └── dispatch.runner.ts   the self-pacing loop + entry point
+    │   ├── dispatch.service.ts  runOnce() — a pure function over the ports
+    │   ├── dispatch.archive.ts  the ONE SELECT against signal_log
+    │   └── dispatch.runner.ts   one run, then exit + entry point
     ├── utils/                   framework-agnostic helpers
     │   ├── envelope.ts          the public v1 envelope + the ErrorReason union
     │   └── errors.ts            AppError + subclasses, each carrying a reason
@@ -99,7 +99,7 @@ Dependency direction is one-way: `module → routes → controller → service`.
 `dispatch.schema.ts` declares the ports (`ArchiveReader`, `SettleClient`),
 `dispatch.service.ts` is a pure function over them, `dispatch.archive.ts` and
 `client/` are the adapters, and `dispatch.runner.ts` binds them. That is why
-`sweepOnce` is tested with fakes and no infrastructure.
+`runOnce` is tested with fakes and no infrastructure.
 
 ## Rules
 
@@ -148,7 +148,7 @@ Dependency direction is one-way: `module → routes → controller → service`.
 | --- | --- |
 | `npm run up` | sets up `.env`, containers, the topic and the ClickHouse schema |
 | `npm run dev` | `tsx watch` — the edge, reload on save |
-| `npm run dispatch` | the dispatcher loop; needs `INTERNAL_SETTLE_SECRET` |
+| `npm run dispatch` | ONE dispatch run, then exits; needs `INTERNAL_SETTLE_SECRET` |
 | `npm run typecheck` | type-check, no emit (includes tests) |
 | `npm run build` | `src/` → `dist/` (excludes tests) |
 | `npm start` | run compiled `dist/server.js` |
@@ -156,7 +156,7 @@ Dependency direction is one-way: `module → routes → controller → service`.
 | `npm run e2e` | end to end against live Kafka + ClickHouse + Postgres |
 | `npm run trace` | walks one signal through every hop, printing each payload |
 | `npm run trace:all` | one signal per case — the matrix in docs/ARCHITECTURE.md |
-| `npm run trace:runner` | the dispatcher LOOP as a process: pacing, backoff, SIGTERM |
+| `npm run trace:runner` | the dispatcher as a PROCESS: exit codes, the overlap, replay |
 | `npm run loadtest` | the generator in `scripts/loadtest.mjs` |
 
 ## Testing
@@ -165,7 +165,7 @@ Dependency direction is one-way: `module → routes → controller → service`.
 `app.inject()` with no port binding. Test services as plain functions; test
 routes through `inject`. Always `await app.close()` in a test that builds an app.
 
-The same rule gives the dispatcher its tests: because `sweepOnce` takes its two
+The same rule gives the dispatcher its tests: because `runOnce` takes its two
 ports as arguments, a test hands it an array-backed archive and a fake settle
 client, and covers batching, concurrency, retries and the known-filter without a
 container in sight. If a new piece of the pipeline is hard to test, the port is

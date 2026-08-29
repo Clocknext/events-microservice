@@ -11,6 +11,17 @@ Verification at the end: **49** unit tests, **111** end-to-end checks against
 live infrastructure, **15** payments-side checks, and a live run of the
 dispatcher loop itself. All green, with the database left as it was found.
 
+> **Read this first if you are here for the current design.** This is a work log,
+> not a description of the system as it stands. The dispatcher was rewritten to
+> the 1.0 model — a one-shot on a 60s timer, reading a time window over
+> `ingested_at`, with no watermark, no cursor route, no `known` filter and no
+> paging. **BUG-3, BUG-7 and BUG-8 are bugs in machinery that no longer exists.**
+> They are kept because each one records *why* a shape was chosen, and the reasons
+> outlived the code: BUG-3 is why the current design needs settle to dedup rather
+> than the dispatcher to filter, BUG-7 is why nothing here pages, and BUG-8 is why
+> a backfill is now an explicit bounded request. FINDING-9 is the one that governs
+> the current model. Current design: [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ---
 
 ## Part 1 — Bugs
@@ -355,6 +366,71 @@ and an under-limit archive is never blocked.
 only the person who read it, in the one flow that prints it. The guard belongs in
 the thing that would do the damage.
 
+### FINDING-9 · The window has to be over `ingested_at`, or the 1.0 model loses rows
+**Severity: critical — and found by reasoning, before it could bite.**
+
+The 1.0 dispatcher keeps no state at all: no watermark, no cursor, no local file.
+It selects a time window and sends everything in it, and settle discards the
+duplicates. Which raises the only hard question in the design — **what does "the
+latest data" mean when nothing remembers what was already sent?**
+
+The obvious answer is wrong. `signal_log` is `ORDER BY (received_at, signal_id)`
+and `PARTITION BY toYYYYMM(received_at)`, so `received_at` is the column everything
+about the table invites you to filter on:
+
+```sql
+-- WRONG, and silent
+WHERE received_at >= now64(3) - 180
+```
+
+`received_at` is stamped by the **edge**, at the moment the customer's request
+arrived — by N instances, off N clocks. The row reaches the archive some time
+later: ClickHouse's Kafka engine flushes in batches, and a broker backlog or a
+ClickHouse restart stretches that to minutes. So a signal with
+`received_at = 10:00:00` can be inserted at `10:04:00`.
+
+Under the *old* model that row was still recoverable — the overlap window read
+back below the watermark for exactly this reason (BUG-3). Under this model there
+is no watermark and no second look. By the time the row exists, the window that
+would have contained it has moved on. **It is never sent, no error is raised, and
+nothing anywhere records that a signal was dropped.** It is the worst shape of
+billing bug: silent, permanent, and invisible to every check that only looks at
+what *did* arrive.
+
+**Fix.** Window over `ingested_at`, which the schema already had as an ops
+column — `DEFAULT now64(3)`, written by ClickHouse when the materialized view's
+insert lands. One clock, one server, and it means precisely "arrived in the
+archive":
+
+```sql
+WHERE ingested_at >= now64(3) - ({windowMs:UInt64} / 1000)
+```
+
+A signal stuck in Kafka for ten minutes lands in whichever window covers the
+minute it *actually arrived*. Ingestion lag stops being a correctness problem and
+becomes latency.
+
+Two details that came with it:
+
+- **`received_at` still travels to settle.** Billing windows cut on it. The
+  selection clock and the billing clock are different columns, and conflating them
+  is how you bill a signal into the wrong period.
+- **The bound is computed by ClickHouse, not by the dispatcher.** `ingested_at` is
+  stamped by the ClickHouse server's clock, so a bound derived from `Date.now()` on
+  the EC2 box would shift the window by whatever skew exists between two machines —
+  silently, again. `now64(3)` in the SQL keeps one clock on both sides of the
+  comparison.
+- **It needs an index** (migration `002`). `ingested_at` is neither the sort key
+  nor the partition key, so the window would otherwise scan every partition and
+  read the `payload` column to do it. `minmax` works because inserts arrive in
+  roughly `ingested_at` order.
+
+**Lesson.** When you delete the thing that remembers, every remaining question
+becomes a question about clocks — and the column that *looks* like the right one
+is the one the table is sorted by, not the one that answers "what is new".
+
+---
+
 ### Also found, not mine, not fixed
 
 - **`npm run verify:credit` is broken** in the payments repo. It imports
@@ -498,10 +574,28 @@ a fully-migrated scratch database: **no drift** for `SignalStatus`.
 
 ## Part 4 — Still open
 
-1. **Partition count.** The topic is on **1 partition**: one consumer of order,
-   no HA, and head-of-line blocking. Repartitioning later moves key→partition
-   placement, so it should be decided before production. 12, keyed by
-   `customerId` as it already is, costs nothing on MSK.
+1. ~~**Partition count.**~~ **RESOLVED 2026-08-27 — start at 1, grow to 3 on a
+   symptom.** The triggers are ClickHouse ingestion lagging or head-of-line
+   blocking ([AWS-SETUP.md](AWS-SETUP.md) Step 0).
+
+   The interesting part is *why this is not the irreversible decision it looks
+   like*. Adding partitions rehashes `customerId`→partition and splits a
+   customer's ordered stream — the standard reason to pick the number up front.
+   It costs nothing here: nothing reads the topic in order. `signal_log` is
+   `ORDER BY (received_at, signal_id)` with dedup on `signal_id`, the dispatcher
+   windows on `ingested_at` and bills on `received_at`, and settle is idempotent
+   on `signalId`. There is no stateful per-customer aggregation to corrupt.
+
+   What *is* real, and was missing: a newly added partition has no committed
+   offset, so librdkafka's default `auto.offset.reset = latest` would skip every
+   message the producer wrote to it before the consumer rebalanced onto it. With
+   no watermark, those signals are gone. Fixed by setting
+   `kafka_auto_offset_reset = 'earliest'` on `kafka_signals` — migration `003`,
+   plus `01-schema.sql`. It is inert until the topic grows, and load-bearing on
+   that day.
+
+   Note 3 partitions would **not** be HA — they would all sit on the single
+   broker.
 2. **Nothing is committed.** Both repos have my changes in the working tree only.
    Both also had unrelated uncommitted changes before I started (a Prisma version
    bump, `.worktrees/`, the `resolve` route) — untouched.

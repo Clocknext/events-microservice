@@ -12,15 +12,13 @@
  */
 import './preload.mjs'
 import { config } from '../../src/config.js'
-import { sweepOnce, toSettleSignal } from '../../src/workers/dispatch/dispatch.service.js'
-import type { SweepOutcome } from '../../src/workers/dispatch/dispatch.schema.js'
-import { fetchCursor } from '../../src/client/payments-client.js'
+import { runOnce, toSettleSignal } from '../../src/workers/dispatch/dispatch.service.js'
 import {
   archiveRow, archiveRowCount, clickhouse, PAYMENTS, postSettle, postSignal, sleep, waitFor,
 } from './harness.mjs'
 import {
-  db, EXPIRED_KEY, KEY, remember, RUN, setup, sweepDeps, teardown, UNKNOWN_KEY,
-  type Fixture,
+  db, E2E_WINDOW_MS, EXPIRED_KEY, KEY, remember, RUN, runDeps, setup, teardown,
+  UNKNOWN_KEY, type Fixture,
 } from './fixtures.mjs'
 
 const B = (s: string) => `\x1b[1m${s}\x1b[0m`
@@ -111,7 +109,10 @@ async function main() {
         ...(c.path ? { path: c.path } : {}),
       })
       c.httpStatus = res.status
-      c.errorReason = res.json.result?.errorReason
+      // Assigned only when present: `errorReason` is an optional property and
+      // `exactOptionalPropertyTypes` is on, so `undefined` is not a value for it.
+      const reason = res.json.result?.errorReason
+      if (reason !== undefined) c.errorReason = reason
       const id = res.json.result?.signalId
       if (res.status === 202 && typeof id === 'string') {
         c.signalId = id
@@ -147,19 +148,20 @@ async function main() {
     const archiveTotal = await clickhouse.query<{ n: string }>('SELECT count() AS n FROM signal_log')
     console.log(`    signal_log holds ${archiveTotal[0]!.n} rows in total`)
 
-    // ── sweep ────────────────────────────────────────────────────────────
-    rule('PHASE 4 · the dispatcher sweeps')
-    const outcomes: SweepOutcome[] = []
-    for (let i = 0; i < 12; i += 1) {
-      const o = await sweepOnce(sweepDeps({ overlapMs: 2_000 }))
-      outcomes.push(o)
-      console.log(`  sweep ${i + 1}  read=${pad(String(o.read), 4)} sent=${pad(String(o.sent), 4)} ` +
-        `processed=${pad(String(o.processed), 4)} userError=${pad(String(o.userError), 4)} ` +
-        `serverError=${pad(String(o.serverError), 3)} alreadyKnown=${pad(String(o.alreadyKnown), 4)} ` +
-        `batches=${o.batchIds.length} saturated=${o.saturated}`)
-      if (o.sent === 0) break
-      await sleep(200)
-    }
+    // ── dispatch ─────────────────────────────────────────────────────────
+    rule('PHASE 4 · the dispatcher runs — ONCE, one window, one call')
+    const o = await runOnce(runDeps())
+    console.log(`  read=${pad(String(o.read), 4)} sent=${pad(String(o.sent), 4)} ` +
+      `processed=${pad(String(o.processed), 4)} userError=${pad(String(o.userError), 4)} ` +
+      `serverError=${pad(String(o.serverError), 3)} skipped=${pad(String(o.skipped), 3)} ` +
+      `capped=${o.capped}`)
+    console.log(`  window=${E2E_WINDOW_MS / 1000}s over ingested_at · ` +
+      `${o.bytes}B json -> ${o.gzipBytes}B gzip · ${o.ms}ms`)
+    console.log(`
+  There is no loop and no second pass. One run reads everything INGESTED in the
+  window and posts all of it in a single request — no batch size, no concurrency,
+  no watermark to advance.`)
+    await sleep(200)
 
     // ── collect verdicts ─────────────────────────────────────────────────
     rule('PHASE 5 · what each signal became')
@@ -175,10 +177,12 @@ async function main() {
         status: row.status, org: row.organizationId,
         attempt: row.attemptCount, signalLogId: row.signalLogId,
       } : null
-      c.verdict = row ? {
-        status: row.status, error_type: row.errorType,
-        error_code: row.errorCode, error_message: row.errorMessage,
-      } : undefined
+      if (row) {
+        c.verdict = {
+          status: row.status, error_type: row.errorType,
+          error_code: row.errorCode, error_message: row.errorMessage,
+        }
+      }
       c.money = !!(await db.one(`select 1 from "SignalLog" where "signalId" = $1`, [c.signalId!]))
     }
 
@@ -240,18 +244,18 @@ async function main() {
       console.log(`  credits      before ${before!.credits}   after ${after!.credits}`)
     }
 
-    rule('PHASE 9 · convergence')
-    const final = await sweepOnce(sweepDeps({ overlapMs: 2_000 }))
-    const cursor = await fetchCursor(500)
-    console.log(`  a fresh sweep now sends       ${final.sent}`)
-    console.log(`  candidates dropped as known   ${final.alreadyKnown}`)
-    console.log(`  cursor.sentThrough            ${cursor.sentThrough}`)
-    console.log(`  cursor.retry                  ${cursor.retry.length} signal(s) due`)
-    if (cursor.retry.length) {
-      for (const r of cursor.retry.slice(0, 5)) {
-        console.log(`      ${r.signalId}  nextAttempt=${r.nextAttempt}`)
-      }
-    }
+    rule('PHASE 9 · the overlap — a second run re-sends the same window')
+    const moneyBefore = await db.one<{ n: string }>('select count(*) n from "SignalLog"')
+    const final = await runOnce(runDeps())
+    const moneyAfter = await db.one<{ n: string }>('select count(*) n from "SignalLog"')
+    console.log(`  a fresh run sends again        ${final.sent}`)
+    console.log(`  money rows before / after     ${moneyBefore!.n} / ${moneyAfter!.n}`)
+    console.log(`
+  It sends the same signals a second time and nothing changes. That is the design,
+  not a leak: the window is wider than the timer's interval so a failed run is
+  covered by the next two, and settle collapses the duplicates onto the same money
+  row (SignalLog.signalId is UNIQUE and is the idempotency key). Nothing is
+  persisted here to make it converge, and nothing needs to be.`)
 
     rule('PHASE 10 · totals')
     const tot = await db.one<{ st: string; ok: string; pend: string; money: string }>(`

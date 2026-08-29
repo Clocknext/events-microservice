@@ -7,7 +7,7 @@ this doc is the remaining AWS wiring.
 ## Architecture
 
 ```
-API clients ──▶ edge (Fastify, on EC2) ──produce──▶ Kafka topic `signals` (1 partition)
+API clients ──▶ edge (Fastify, box-edge) ──produce──▶ Kafka (box-kafka) topic `signals` (1 partition)
                                                           │  ClickHouse pulls it itself
                                                           ▼
                                                  kafka_signals (ENGINE=Kafka)
@@ -17,10 +17,14 @@ API clients ──▶ edge (Fastify, on EC2) ──produce──▶ Kafka topic 
 ```
 
 - **No consumer/worker process for INGEST.** ClickHouse's Kafka table engine does
-  it. A separate dispatcher process reads `signal_log` and posts batches to the
-  payments app's `/api/internal/settle` — see "The dispatcher" below.
+  it. A separate dispatcher one-shot, on a 60s timer, reads one window of
+  `signal_log` and posts all of it to the payments app's `/api/internal/settle`
+  in a single call — see "The dispatcher" below.
 - The Node app is **only the edge producer** (`src/`), run as a long-lived process.
-- **One partition.** Signals land as-is in one ordered stream.
+- **One partition**, keyed by `customerId`. Grows to 3 on a measured symptom, and
+  growing is cheap because nothing reads the topic in order — but only with
+  `kafka_auto_offset_reset = 'earliest'` already set (migration `003`). See
+  [AWS-SETUP.md](AWS-SETUP.md) Step 0.
 - Billing data: at-least-once (ClickHouse commits offsets only after the MV
   insert) + dedup on `signal_id` (`ReplacingMergeTree`); money reads use
   `count(DISTINCT signal_id)` / `FINAL`.
@@ -43,7 +47,9 @@ choice, so settle it before provisioning:
 
 - **MSK Serverless is IAM-only** (SASL/OAUTHBEARER with `AWS_MSK_IAM`). The **edge
   handles this fine** — kafkajs signs an IAM token (`aws-msk-iam-sasl-signer-js`,
-  already wired; set `KAFKA_USE_IAM=true`).
+  already wired; set `KAFKA_USE_IAM=true`). Note that **MSK provisioned also
+  supports IAM**, so choosing provisioned does not mean giving up IAM — it only
+  adds SCRAM and mTLS as options.
 - **ClickHouse's Kafka engine (librdkafka) has no built-in AWS MSK IAM token
   provider.** So ClickHouse **cannot** natively consume from MSK Serverless.
 
@@ -53,10 +59,24 @@ Pick one path:
    MSK provisioned supports SCRAM; ClickHouse's Kafka engine speaks
    `SASL_SSL` + `SCRAM-SHA-512` out of the box. The edge can use SCRAM too, or
    keep IAM if you enable both. Simplest way to keep "ClickHouse pulls directly".
-2. **ClickHouse Cloud + ClickPipes, on MSK Serverless (IAM).** ClickPipes is a
-   managed Kafka connector that *does* support MSK IAM. You keep MSK Serverless;
-   ClickPipes replaces the `kafka_signals`/MV pair (the destination `signal_log`
-   table is unchanged). Choose this if you want MSK Serverless + managed ClickHouse.
+2. **ClickHouse Cloud + ClickPipes, on MSK provisioned with IAM.** ClickPipes is a
+   managed Kafka connector that *does* speak MSK IAM, which removes the librdkafka
+   limitation entirely — so the edge and the ingest both keep IAM. ClickPipes
+   replaces the `kafka_signals`/MV pair (the destination `signal_log` table is
+   unchanged) and runs inside ClickHouse Cloud, so there is still no consumer
+   process of ours. Choose this if you want managed ClickHouse.
+
+   ⚠️ **Not on MSK Serverless.** ClickPipes reaches a private cluster through a
+   *reverse private endpoint*, whose documented setup requires MSK **multi-VPC
+   private connectivity** — you enable it on the cluster and grant the ClickPipes
+   account (`arn:aws:iam::072088201116:root`) `kafka:CreateVpcConnection`,
+   `GetBootstrapBrokers`, `DescribeCluster`, `DescribeClusterV2` in the cluster
+   policy. That feature belongs to **provisioned** clusters. MSK Serverless does
+   not expose it and has no public endpoint either, so reaching it from ClickHouse
+   Cloud means VPC peering, Transit Gateway, or a self-managed NLB plus your own
+   PrivateLink endpoint service, with Route 53 private hosted zones or resolver
+   rules for the broker DNS. Provisioned + IAM is also **cheaper** than the
+   Serverless floor — see [COSTS.md](COSTS.md).
 3. **mTLS (TLS client certs)** on MSK provisioned — also supported by librdkafka;
    viable but more cert plumbing than SCRAM.
 
@@ -69,15 +89,26 @@ self-hosted ClickHouse case, and notes ClickPipes deltas where relevant.
   **SASL/SCRAM** auth; store the broker user/password in **Secrets Manager**
   (MSK requires the secret name to start with `AmazonMSK_`) and associate it with
   the cluster. Enable TLS in transit.
-- Topic **`signals`**: **1 partition**, replication factor **3**,
-  `min.insync.replicas=2`, and a generous **retention** (e.g. 7 days) so
-  ClickHouse can be rebuilt by replay after any incident.
+- Topic **`signals`**: **1 partition** (Step 0 of AWS-SETUP.md), replication
+  factor **3**, `min.insync.replicas=2`, and a generous **retention**
+  (e.g. 7 days) so ClickHouse can be rebuilt by replay after any incident.
+  Replication factor 3 assumes a **3-broker** cluster; the single-broker plan in
+  AWS-SETUP.md §4 uses factor 1, since asking for more replicas than brokers
+  fails outright. Partitions and replicas are independent knobs — 3 partitions on
+  one broker is not replicated.
 - Create the topic explicitly (don't rely on auto-create):
   `kafka-topics.sh --create --topic signals --partitions 1 --replication-factor 3 ...`
   (run from a bastion/admin box that can reach the brokers, authenticated with the
   SCRAM creds).
 - Security group: allow the edge SG and the ClickHouse SG inbound on the SASL_SSL
   port (9096 for SCRAM on MSK).
+
+> **The provisioning runbook is [AWS-SETUP.md](AWS-SETUP.md)** and it is the
+> authority on the deployed shape: **two** EC2 boxes — `box-edge` (edge + dispatch
+> timers) and `box-kafka` (self-hosted Kafka, public `SASL_SSL` on 9094) — plus
+> ClickHouse Cloud, one ALB and one CloudFront distribution. **No MSK.** The MSK
+> path below is kept as the comparison that decision was made against; where the
+> two disagree, AWS-SETUP.md wins.
 
 ## 2. The edge on EC2
 
@@ -151,26 +182,44 @@ ClickHouse is the archive, not the biller. `/api/internal/settle` (in the paymen
 app) owns the pricing and the Postgres writes, so something has to carry signals
 from one to the other.
 
+**It is a one-shot on a systemd timer, not a supervised long-lived process.** One
+run reads everything ingested in the last `DISPATCH_WINDOW_MS`, posts all of it in
+a single gzipped call, and exits. The units, the install and the alerts are in
+[deploy/systemd/README.md](../deploy/systemd/README.md); the rest of this section
+is why it is shaped that way.
+
 - **`signal_log.api_key_hash`** is what makes a signal attributable. The edge
   stamps the SHA-256 digest of the caller's `cnk_…` key onto every message
   envelope; the raw key never leaves the edge process. Settle resolves the
   organisation from that digest in one query — `ApiKey.hashedKey` stores the same
   value — so the dispatcher forwards the digest and nothing else.
-- **What is still worth sending** is answered by Postgres, not ClickHouse. Settle
-  upserts one `SignalStatus` row per signal (the signals-pipeline twin of
-  `RawUsageLog`), and its `(status, attemptCount, receivedAt)` index is the sweep
-  query. ClickHouse stays read-only to everything but the Kafka engine.
-- **Over-sending is free.** `SignalLog.signalId` is UNIQUE and settle uses it as
-  the idempotency key, so a re-sent signal replays onto the original money row
-  instead of charging twice. That is what lets the dispatcher be at-least-once
-  with no claim, lease or visibility timeout.
-- **500 per batch, several batches at once.** 500 is settle's enforced cap. A
-  batch is split across `INTERNAL_WORKER` workers that each walk their chunk one
-  signal at a time, so a bigger batch buys no throughput — only a longer wall
-  time and a worse timeout. Concurrency comes from `INTERNAL_BATCH_CONCURRENCY`.
-- **Retry policy mirrors the existing cron sweeper** (`/api/cron/usage-logs/process`):
-  retry a row with no error or a `SERVER_ERROR`, never a `USER_ERROR` (it cannot
-  self-heal and waits for a manual retry), and stop at 5 attempts.
+- **What to send is answered by the clock, not by Postgres.** The run selects on
+  `signal_log.ingested_at` — ClickHouse's own insert timestamp — and asks nothing
+  about what it sent before. Selecting on `received_at` instead would be a silent
+  data-loss bug: that is the caller's time, stamped by N edge instances off N
+  clocks, and a row can land in the archive minutes after it. With no watermark
+  anywhere, such a row would never be picked up. `ingested_at` needs its `minmax`
+  skip index (migration `002`) or the window is a full partition scan.
+- **Over-sending is free, and is the error recovery.** `SignalLog.signalId` is
+  UNIQUE and settle uses it as the idempotency key, so a re-sent signal replays
+  onto the original money row instead of charging twice. The window is 3x the
+  timer's interval deliberately: every signal goes about three times, a failed run
+  is covered by the next two, and nothing has to be persisted for that to work.
+- **The hourly reconciliation is the outage net.** The 3-minute window covers any
+  single failed tick but not three in a row — those rows fall out of it and are
+  never sent again. A second timer runs the same binary hourly over a 2-hour
+  window, re-sending signals settle then discards.
+- **One call, gzipped.** No batch size and no concurrency. Vercel caps a
+  serverless function's request body at 4.5MB, which raw signal JSON crosses at
+  roughly 15k signals; signal JSON compresses about 10:1, and
+  `dispatch.body_near_limit` warns before the ceiling. This assumes settle accepts
+  one large call — its 500 cap removed, and its `INTERNAL_WORKER` per-signal walk
+  replaced by a bulk insert. **Both are prerequisites, not optional tuning.**
+- **Retry policy lives in settle now**, and it is what stops the overlap being
+  ruinous. On re-receipt: re-process a `SERVER_ERROR`, no-op a `PROCESSED`, never
+  retry a `USER_ERROR` (it cannot self-heal and waits for a manual fix). Get it
+  wrong in one direction and every transient failure becomes permanent silence; in
+  the other, the whole window is re-priced every minute.
 
 ## Operational notes
 
@@ -179,6 +228,10 @@ from one to the other.
   offset (detach/re-attach `kafka_signals`, or a new group name).
 - **Money reads always use `FINAL` or `GROUP BY signal_id`** — pre-merge
   duplicates from at-least-once delivery are expected and collapse on merge.
-- **Scaling later:** one partition = one consumer of order. If throughput ever
-  needs more, add partitions and (for the direct model) `kafka_num_consumers`; be
-  aware repartitioning changes key→partition placement.
+- **Scaling later:** one partition caps ingest parallelism at one consumer, so
+  `kafka_num_consumers` cannot help until the topic grows. Grow it with
+  `--alter --topic signals --partitions 3`; then raise `kafka_num_consumers`
+  toward 3 *with* `kafka_thread_per_consumer = 1`, or the extra consumers share
+  one stream thread. Precondition either way:
+  `kafka_auto_offset_reset = 'earliest'` must already be set, or new partitions
+  start at `latest` and silently skip messages.

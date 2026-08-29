@@ -1,14 +1,20 @@
 /**
  * Fixtures for the end-to-end run: the real org it borrows, the API-key swap and
- * its restore, the watermark that keeps the sweep off older archive rows, and the
- * shared sweep helpers. The cases themselves live in `scripts/e2e.mts`.
+ * its restore, and the shared dispatch helper. The cases themselves live in
+ * `scripts/e2e.mts`.
+ *
+ * SCOPE IS CONTROLLED BY THE WINDOW. There is no watermark to park any more: the
+ * dispatcher reads whatever was INGESTED in the last DISPATCH_WINDOW_MS, so a
+ * tight window is what keeps this run off the archive's older rows (16k of them,
+ * from earlier load tests) — they were ingested hours ago and simply are not in
+ * it.
  *
  * The pipeline under test:
  *
  *   edge (Fastify) → Kafka → ClickHouse → dispatcher → /api/internal/settle → Postgres
  *
  * Nothing here is mocked. It drives a real HTTP request into the edge, waits for
- * ClickHouse's Kafka engine to ingest it, runs the real dispatcher sweep, and then
+ * ClickHouse's Kafka engine to ingest it, runs the real dispatcher, and then
  * asserts on the rows the payments app wrote to Postgres.
  *
  * PREREQUISITES — start these first:
@@ -29,18 +35,25 @@
 import { randomUUID } from 'node:crypto'
 import { config } from '../../src/config.js'
 import { createArchiveReader } from '../../src/workers/dispatch/dispatch.archive.js'
-import { sweepOnce, toIso, type SweepDeps } from '../../src/workers/dispatch/dispatch.service.js'
-import type { SweepOutcome } from '../../src/workers/dispatch/dispatch.schema.js'
-import { fetchCursor, fetchKnown, settleBatch } from '../../src/client/payments-client.js'
+import { runOnce, toIso, type RunDeps } from '../../src/workers/dispatch/dispatch.service.js'
+import type { RunOutcome } from '../../src/workers/dispatch/dispatch.schema.js'
+import { settleAll } from '../../src/client/payments-client.js'
 import {
   archiveRow, archiveRowCount, check, clickhouse, Db, EDGE, env, heading,
   PAYMENTS, postSettle, postSignal, report, sha256, sleep, uuid, waitFor,
 } from './harness.mjs'
-import { writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createDecipheriv, createHash } from 'node:crypto'
 
 export const RUN = randomUUID().slice(0, 8)
-export const RECOVERY = `/tmp/claude-1000/-home-joze-Learning-AWS-internal/57303029-2f75-49a9-ab4c-d01ca41f7bc9/scratchpad/e2e-recovery-${RUN}.json`
+/** Where the borrowed key's ORIGINAL hash is parked before we overwrite it, so a
+ *  run that dies mid-flight can be repaired by hand. Must not point anywhere
+ *  ephemeral or machine-specific — a missing directory here aborts the run. */
+const RECOVERY_DIR = join(tmpdir(), 'events-microservice-e2e')
+mkdirSync(RECOVERY_DIR, { recursive: true })
+export const RECOVERY = join(RECOVERY_DIR, `e2e-recovery-${RUN}.json`)
 
 /** The raw key this run sends. Never stored anywhere but this process. */
 export const KEY = `cnk_e2e_${RUN}_${randomUUID().replace(/-/g, '')}`
@@ -97,31 +110,41 @@ export interface Fixture {
   expiredOrgId: string
 }
 
-/** One sweep with the real ClickHouse + real payments app behind it. */
-export function sweepDeps(overrides: Partial<SweepDeps['config']> = {}): SweepDeps {
+/** How far back an e2e dispatch looks, in ms.
+ *
+ *  Tight on purpose. It has to comfortably cover the seconds between a signal
+ *  being posted and this run dispatching it, while excluding the archive's older
+ *  rows — which is the job the watermark used to do. */
+export const E2E_WINDOW_MS = 90_000
+
+/** One dispatch run with the real ClickHouse + real payments app behind it. */
+export function runDeps(overrides: Partial<RunDeps['config']> = {}): RunDeps {
   return {
     archive: createArchiveReader(clickhouse),
-    payments: { cursor: fetchCursor, known: fetchKnown, settle: settleBatch },
+    payments: { settle: settleAll },
     config: {
-      batchSize: config.dispatchBatchSize,
-      concurrency: config.dispatchConcurrency,
-      // Tight by default so a sweep does not drag in the archive's older rows.
-      overlapMs: 2_000,
+      windowMs: E2E_WINDOW_MS,
+      maxRows: config.dispatchMaxRows,
       ...overrides,
     },
     newBatchId: uuid,
   }
 }
 
-export async function sweepUntilQuiet(max = 8, cfg?: Partial<SweepDeps['config']>): Promise<SweepOutcome[]> {
-  const outcomes: SweepOutcome[] = []
-  for (let i = 0; i < max; i += 1) {
-    const outcome = await sweepOnce(sweepDeps(cfg))
-    outcomes.push(outcome)
-    if (outcome.sent === 0) break
-    await sleep(150)
-  }
-  return outcomes
+/**
+ * One dispatch run — which is the whole of it now. There is no "sweep until
+ * quiet": a single run sends every row in the window in one call, so calling it
+ * twice sends the same signals twice (settle dedups them) rather than making
+ * progress.
+ *
+ * NOTE for anyone reading an assertion below: `outcome.sent` is NOT "new work".
+ * It is everything in the window, re-sent every run by design. The evidence that
+ * something happened is always the Postgres rows, never this count.
+ */
+export async function dispatch(cfg?: Partial<RunDeps['config']>): Promise<RunOutcome> {
+  const outcome = await runOnce(runDeps(cfg))
+  await sleep(150)
+  return outcome
 }
 
 interface StatusRow {
@@ -144,10 +167,22 @@ export async function preflight(): Promise<void> {
   heading('0 · preflight')
   const edge = await fetch(`${EDGE}/health`).then((r) => r.status).catch(() => 0)
   check('the edge answers on /health', edge, 200)
-  const cursor = await fetch(`${PAYMENTS}/api/internal/signals/cursor`, {
-    headers: { authorization: `Bearer ${env.internalSecret}` },
+  // The settle route, which is now the ONLY thing this repo calls on the payments
+  // side (`signals/cursor` and `signals/known` were deleted with the watermark).
+  //
+  // Probed with a valid secret and a body it must refuse: a 400 proves the route
+  // exists AND the shared secret was accepted, which is strictly more than the
+  // old 200-from-cursor told us. A 401 here is a secret mismatch; a 404 means the
+  // payments app is running something older than this repo expects.
+  const settle = await fetch(`${PAYMENTS}/api/internal/settle`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${env.internalSecret}`,
+      'content-type': 'application/json',
+    },
+    body: '{}',
   }).then((r) => r.status).catch(() => 0)
-  check('the payments cursor route answers', cursor, 200)
+  check('the payments settle route answers, and takes our shared secret', settle, 400)
   const ch = await clickhouse.query<{ n: string }>('SELECT count() AS n FROM signal_log')
   check('ClickHouse is reachable', ch.length, 1)
   console.log(`        archive holds ${ch[0]!.n} rows`)
@@ -221,15 +256,9 @@ export async function setup(): Promise<Fixture> {
     [`e2e_key_${RUN}`, expiredOrg!.id, sha256(EXPIRED_KEY), fixture.user_id])
   check('an expired key row exists for the expired-key case', 1, 1)
 
-  // Park the watermark at "now" so the sweep ignores the archive's existing rows
-  // (16k from earlier load tests). This is the cursor mechanism doing its job.
-  await db.exec(`
-    insert into "SignalStatus" (id, "signalId", status, "attemptCount", "receivedAt", "updatedAt")
-    values ($1, $2, 'PROCESSED', 1, now(), now())`,
-    [`e2e_wm_${RUN}`, `e2e_watermark_${RUN}`])
-  const cursor = await fetchCursor(5)
-  check('the watermark moved forward, so old archive rows are out of scope',
-    cursor.sentThrough !== null, true)
+  // NO WATERMARK IS PARKED. It used to be, to keep the sweep off the archive's
+  // 16k older rows; scope is now the ingestion window instead (E2E_WINDOW_MS),
+  // and those rows were ingested hours ago.
 
   return {
     orgId: fixture.org_id, customerId: fixture.customer_id, agentKey: fixture.agent_key,
@@ -294,9 +323,8 @@ export async function teardown(fixture: Fixture | null): Promise<void> {
     `delete from "SignalLog" where "signalId" like $1 or "signalId" = any($2)`,
     [`e2e_${RUN}%`, ids])
   const statuses = await db.exec(
-    `delete from "SignalStatus"
-      where "signalId" like $1 or "signalId" = $2 or "signalId" = any($3)`,
-    [`e2e_${RUN}%`, `e2e_watermark_${RUN}`, ids])
+    `delete from "SignalStatus" where "signalId" like $1 or "signalId" = any($2)`,
+    [`e2e_${RUN}%`, ids])
   // By id pattern, not via `fixture`: the safety net calls this with null.
   await db.exec(`delete from "Organization" where id = $1`, [`e2e_org_${RUN}`])
   console.log(`        removed ${logs} SignalLog + ${statuses} SignalStatus rows and the throwaway org`)

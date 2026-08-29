@@ -1,16 +1,21 @@
 /**
- * Exercises the DISPATCHER LOOP as a real process — not `sweepOnce` called by
- * hand, which is what every other script here does.
+ * Exercises the DISPATCHER AS A REAL PROCESS — not `runOnce` called by hand,
+ * which is what every other script here does.
  *
- * Spawns `dispatch.runner.ts` exactly as a supervisor would, feeds the edge while
- * it runs, and reads its own log to see: the self-pacing nap, a saturated sweep
- * going straight round again, the error backoff when ClickHouse disappears, and
- * a graceful SIGTERM that finishes the sweep in flight.
+ * It is a ONE-SHOT now, so what there is to see is different from the old loop:
+ * no self-pacing nap, no backoff, no graceful drain. What matters instead is that
+ * a run does the whole job and then exits, and that its EXIT CODE tells a timer
+ * the truth — because with no state between runs, the exit code is the only thing
+ * that distinguishes "nothing to do" from "this will never work".
+ *
+ *   0  sent, or nothing to send
+ *   1  transient — the next tick retries
+ *   2  misconfigured — every tick will fail identically until a human acts
  *
  *   npm run trace:runner
  */
 import './preload.mjs'
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { db, KEY, remember, RUN, setup, teardown, type Fixture } from './fixtures.mjs'
@@ -21,15 +26,13 @@ const B = (s: string) => `\x1b[1m${s}\x1b[0m`
 const rule = (n: string) => console.log(`\n${B('═'.repeat(88))}\n${B(n)}\n${B('═'.repeat(88))}`)
 
 interface LogLine { at: string; event: string; [k: string]: unknown }
+interface Run { code: number | null; lines: LogLine[]; raw: string[]; ms: number }
 
-/** Spawns the runner and collects its JSON log lines as they arrive. */
-function startDispatcher(env: Record<string, string>): {
-  child: ChildProcessWithoutNullStreams
-  lines: LogLine[]
-  raw: string[]
-} {
+/** Runs the dispatcher once, to completion, and returns everything it said. */
+function dispatchOnce(env: Record<string, string> = {}): Promise<Run> {
   const lines: LogLine[] = []
   const raw: string[] = []
+  const startedAt = Date.now()
   const child = spawn('npx', ['tsx', 'src/workers/dispatch/dispatch.runner.ts'], {
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -43,22 +46,21 @@ function startDispatcher(env: Record<string, string>): {
   }
   child.stdout.on('data', consume)
   child.stderr.on('data', consume)
-  return { child, lines, raw }
+  return new Promise((resolve) => {
+    child.once('exit', (code) => resolve({ code, lines, raw, ms: Date.now() - startedAt }))
+  })
 }
 
-const waitForEvent = async (lines: LogLine[], event: string, timeoutMs = 40_000) => {
-  const until = Date.now() + timeoutMs
-  while (Date.now() < until) {
-    const hit = lines.find((l) => l.event === event)
-    if (hit) return hit
-    await sleep(200)
+const show = (r: Run) => {
+  for (const l of r.lines) {
+    const { at: _at, event, ...rest } = l
+    console.log(`  ${String(event).padEnd(26)} ${JSON.stringify(rest)}`)
   }
-  return null
+  console.log(`  ${B('exit')} ${r.code}   after ${r.ms}ms`)
 }
 
 async function main() {
   let fixture: Fixture | null = null
-  let dispatcher: ReturnType<typeof startDispatcher> | null = null
   await db.connect()
   try {
     fixture = await setup()
@@ -69,64 +71,63 @@ async function main() {
       ...(fx.agentKey ? { agentKey: fx.agentKey } : {}), ...over,
     })
 
-    // ── 1 · start it, as a supervisor would ────────────────────────────────
-    rule('1 · spawn `tsx src/workers/dispatch/dispatch.runner.ts`')
-    dispatcher = startDispatcher({
-      DISPATCH_OVERLAP_MS: '2000',
-      DISPATCH_IDLE_MS: '1000',
-      DISPATCH_BATCH_SIZE: '20',      // small, so a burst saturates and we can see it
-      DISPATCH_CONCURRENCY: '2',
-    })
-    const started = await waitForEvent(dispatcher.lines, 'dispatcher.start')
-    console.log(`  pid ${dispatcher.child.pid}`)
-    console.log(`  ${JSON.stringify(started)}`)
+    // ── 1 · an idle run ────────────────────────────────────────────────────
+    rule('1 · an IDLE run — one query, nothing to send, exit 0')
+    const idle = await dispatchOnce({ DISPATCH_WINDOW_MS: '2000' })
+    show(idle)
+    console.log(`
+  A 2s window with nothing in it. This is what 1,439 of the day's 1,440 runs cost
+  when traffic is quiet: one indexed query and a process start.`)
 
-    // ── 2 · feed it while it runs ──────────────────────────────────────────
-    rule('2 · post 50 signals at the edge and let the loop find them')
+    // ── 2 · a real run ─────────────────────────────────────────────────────
+    rule('2 · post 50 signals, then ONE run to settle all of them')
     const posted = await Promise.all(Array.from({ length: 50 }, (_, i) =>
       postSignal(body({ inputTokens: 100 + i, idempotencyKey: `runner_${RUN}_${i}` }), { key: KEY })))
     const ids = posted.filter((r) => r.status === 202).map((r) => String(r.json.result?.signalId))
     ids.forEach(remember)
     console.log(`  ${ids.length}/50 accepted at the edge — nothing else was told`)
 
-    // Wait until the loop has settled them all, purely by watching Postgres.
-    const until = Date.now() + 90_000
-    let settled = 0
+    // Wait for ClickHouse's Kafka engine to ingest them; the run reads the
+    // archive, so anything not yet ingested simply is not in the window.
+    const until = Date.now() + 60_000
     while (Date.now() < until) {
-      settled = Number((await db.one<{ n: string }>(
-        `select count(*) n from "SignalStatus" where "signalId" = any($1) and status = 'PROCESSED'`,
-        [ids]))!.n)
-      if (settled === ids.length) break
-      await sleep(500)
+      const n = Number((await db.one<{ n: string }>(
+        `select count(*) n from "SignalStatus" where "signalId" = any($1)`, [ids]))!.n)
+      if (n > 0) break
+      const r = await dispatchOnce({ DISPATCH_WINDOW_MS: '120000' })
+      if (r.lines.some((l) => l.event === 'dispatch.run' && Number(l.sent) > 0)) { show(r); break }
+      await sleep(2_000)
     }
-    console.log(`  the loop settled ${settled}/${ids.length} without being asked`)
+    const settled = Number((await db.one<{ n: string }>(
+      `select count(*) n from "SignalStatus" where "signalId" = any($1) and status = 'PROCESSED'`,
+      [ids]))!.n)
+    console.log(`\n  settled ${settled}/${ids.length} — in a single call, no batching`)
 
-    rule('3 · what the loop logged')
-    for (const l of dispatcher.lines.filter((x) => x.event === 'sweep.done')) {
-      console.log(`  sent=${String(l.sent).padEnd(4)} processed=${String(l.processed).padEnd(4)} ` +
-        `userError=${String(l.userError).padEnd(3)} alreadyKnown=${String(l.alreadyKnown).padEnd(4)} ` +
-        `batches=${(l.batchIds as string[]).length} saturated=${l.saturated}`)
-    }
-    const sweeps = dispatcher.lines.filter((x) => x.event === 'sweep.done')
-    console.log(`\n  ${sweeps.length} sweep(s) reported work.`)
-    console.log('  A sweep with saturated=true went straight round with no nap;')
-    console.log('  the loop is silent while idle — sweep.done is only logged when it did something.')
+    // ── 3 · the overlap ───────────────────────────────────────────────────
+    rule('3 · run it AGAIN — it re-sends the same window, and nothing changes')
+    const moneyBefore = await db.one<{ n: string }>('select count(*) n from "SignalLog"')
+    const second = await dispatchOnce({ DISPATCH_WINDOW_MS: '120000' })
+    show(second)
+    const moneyAfter = await db.one<{ n: string }>('select count(*) n from "SignalLog"')
+    console.log(`  money rows before / after: ${moneyBefore!.n} / ${moneyAfter!.n}`)
+    console.log(`
+  It sent them all a second time. That is the design: the window is wider than the
+  timer's interval so a failed run is covered by the next two, and settle collapses
+  the duplicates onto the same money row. Nothing is persisted to make this
+  converge, and nothing needs to be.`)
 
-    // ── 4 · the backoff, by taking ClickHouse away ─────────────────────────
-    rule('4 · stop ClickHouse — the loop should back off, not die')
-    const before = dispatcher.lines.length
+    // ── 4 · transient failure ──────────────────────────────────────────────
+    rule('4 · stop ClickHouse — the run must exit 1, not hang and not exit 0')
     await run('docker', ['compose', 'stop', 'clickhouse'])
     console.log('  clickhouse stopped')
-    const errored = await waitForEvent(dispatcher.lines.slice(before), 'sweep.error', 30_000)
-      ?? await waitForEvent(dispatcher.lines, 'sweep.error', 5_000)
-    const errors = dispatcher.lines.filter((l) => l.event === 'sweep.error')
-    for (const e of errors.slice(0, 5)) {
-      console.log(`  failures=${e.failures} retryInMs=${e.retryInMs}  ${String(e.error).slice(0, 70)}`)
-    }
-    console.log(`\n  alive after the outage? ${dispatcher.child.exitCode === null ? 'yes' : `NO (exit ${dispatcher.child.exitCode})`}`)
-    console.log(`  backoff climbed as designed: ${errors.map((e) => e.retryInMs).join(' → ')}`)
+    const broken = await dispatchOnce({ DISPATCH_WINDOW_MS: '120000' })
+    show(broken)
+    console.log(`
+  Exit 1 with fatal=false. There is no backoff in here any more — the TIMER is the
+  backoff, and the next tick simply tries again 60s later. A one-shot that cannot
+  read the archive has nothing to wait for.`)
 
-    rule('5 · bring ClickHouse back — the loop should recover on its own')
+    rule('5 · bring it back — the very next run recovers, with no state to repair')
     await run('docker', ['compose', 'start', 'clickhouse'])
     for (let i = 0; i < 60; i += 1) {
       const { stdout } = await run('docker', ['inspect', '-f', '{{.State.Health.Status}}', 'clickhouse'])
@@ -134,52 +135,37 @@ async function main() {
       await sleep(1_000)
     }
     console.log('  clickhouse healthy again')
-    const errCountBefore = dispatcher.lines.filter((l) => l.event === 'sweep.error').length
-    const one = await postSignal(body({ idempotencyKey: `recover_${RUN}` }), { key: KEY })
-    const recoveredId = String(one.json.result?.signalId ?? '')
-    remember(recoveredId)
-    const recoveredUntil = Date.now() + 60_000
-    let recovered = false
-    while (Date.now() < recoveredUntil) {
-      const row = await db.one(`select 1 from "SignalStatus" where "signalId" = $1`, [recoveredId])
-      if (row) { recovered = true; break }
-      await sleep(500)
-    }
-    const errCountAfter = dispatcher.lines.filter((l) => l.event === 'sweep.error').length
-    console.log(`  a signal posted after recovery was settled by the loop: ${recovered ? 'yes' : 'NO'}`)
-    console.log(`  further errors while recovering: ${errCountAfter - errCountBefore}`)
+    const recovered = await dispatchOnce({ DISPATCH_WINDOW_MS: '120000' })
+    show(recovered)
 
-    // ── 6 · graceful stop ──────────────────────────────────────────────────
-    rule('6 · SIGTERM — it should finish the sweep in flight, then exit 0')
-    const exited = new Promise<number | null>((resolve) =>
-      dispatcher!.child.once('exit', (code) => resolve(code)))
-    dispatcher.child.kill('SIGTERM')
-    const code = await Promise.race([exited, sleep(20_000).then(() => 'timeout' as const)])
-    const stopping = dispatcher.lines.find((l) => l.event === 'dispatcher.stopping')
-    const stopped = dispatcher.lines.find((l) => l.event === 'dispatcher.stopped')
-    console.log(`  logged dispatcher.stopping : ${stopping ? `yes (${stopping.signal})` : 'NO'}`)
-    console.log(`  logged dispatcher.stopped  : ${stopped ? 'yes' : 'NO'}`)
-    console.log(`  exit code                  : ${code}`)
-    dispatcher = null
+    // ── 6 · the two fatal cases ────────────────────────────────────────────
+    rule('6 · no INTERNAL_SETTLE_SECRET — exit 2, refusing to 401 every minute')
+    show(await dispatchOnce({ INTERNAL_SETTLE_SECRET: '' }))
 
-    // ── 7 · refuses to start without the secret ────────────────────────────
-    rule('7 · no INTERNAL_SETTLE_SECRET — it must refuse to start, not 401 in a loop')
-    const bad = startDispatcher({ INTERNAL_SETTLE_SECRET: '' })
-    const badExit = await new Promise<number | null>((resolve) =>
-      bad.child.once('exit', (c) => resolve(c)))
-    const fatal = bad.lines.find((l) => l.event === 'dispatcher.fatal')
-    console.log(`  exit code ${badExit}`)
-    console.log(`  ${fatal ? String(fatal.error) : bad.raw.slice(-2).join(' ')}`)
+    rule('7 · a malformed replay window — exit 2, not a window nobody asked for')
+    show(await dispatchOnce({ DISPATCH_SINCE: 'last tuesday' }))
+    console.log(`
+  A typo in DISPATCH_SINCE must never be interpreted. Silently reading the wrong
+  window is how a manual replay turns into a re-price of the whole archive.`)
 
-    rule('8 · totals')
+    // ── 8 · the replay tool ────────────────────────────────────────────────
+    rule('8 · a deliberate replay — DISPATCH_SINCE/UNTIL, the gap-filling tool')
+    const since = new Date(Date.now() - 10 * 60_000).toISOString()
+    const replay = await dispatchOnce({ DISPATCH_SINCE: since, DISPATCH_UNTIL: new Date().toISOString() })
+    show(replay)
+    console.log(`
+  This is how a gap left by an outage longer than the reconciliation window gets
+  filled: an explicit [since, until) over ingested_at. No code change, and no
+  cursor to rewind — because there is no cursor.`)
+
+    rule('9 · totals')
     const tot = await db.one<{ ok: string; money: string }>(`
       select (select count(*) from "SignalStatus" where "signalId" = any($1) and status='PROCESSED') ok,
              (select count(*) from "SignalLog"    where "signalId" = any($1))                        money`,
-      [[...ids, recoveredId]])
-    console.log(`  settled by the LOOP (not by a hand-driven sweep): ${tot!.ok}`)
-    console.log(`  money rows                                      : ${tot!.money}`)
+      [ids])
+    console.log(`  settled by the runner process: ${tot!.ok}`)
+    console.log(`  money rows                   : ${tot!.money}  (never more than one per signal)`)
   } finally {
-    if (dispatcher && dispatcher.child.exitCode === null) dispatcher.child.kill('SIGKILL')
     try { await run('docker', ['compose', 'start', 'clickhouse']) } catch { /* already up */ }
     try { await teardown(fixture) } finally { await db.close() }
   }
