@@ -28,7 +28,7 @@ The payments app lives in a **separate repository** (`Clocknext-Payment-Saas`) a
 owns all pricing and all Postgres writes. This repo never talks to Postgres in
 production code — only the E2E script does, to assert.
 
-Four documents, in the order worth reading them:
+Seven documents, in the order worth reading them:
 
 | Doc | What |
 | --- | --- |
@@ -36,6 +36,9 @@ Four documents, in the order worth reading them:
 | [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | the code that matters, the config, and a manual runbook using only `curl`/`jq`/`psql` |
 | [docs/FINDINGS.md](docs/FINDINGS.md) | the bugs this design already hit, and why each fix is shaped the way it is |
 | [docs/PRODUCTION.md](docs/PRODUCTION.md) | the remaining AWS wiring |
+| [docs/COSTS.md](docs/COSTS.md) | what that wiring costs — free tier, on-demand and committed rates for MSK, EC2, ClickHouse and the ALB |
+| [docs/setup.md](docs/setup.md) | the narrow first goal: `/api/v1/signal` reachable on real AWS, producing to a real topic, TLS and the dispatcher deferred |
+| [docs/AWS-SETUP.md](docs/AWS-SETUP.md) | the same ground click by click, assuming no prior AWS |
 
 Read ARCHITECTURE before changing the pipeline.
 
@@ -61,12 +64,12 @@ src/
 │   └── kafka.ts               decorates app.producer (SignalProducer | null)
 ├── client/                    outbound, DISPATCHER ONLY — the edge uses neither
 │   ├── clickhouse.ts          read-only reader over HTTP + JSONEachRow
-│   └── payments-client.ts     cursor / known / settle
-├── workers/dispatch/          the dispatcher process
+│   └── payments-client.ts     settleAll() — one gzipped POST, nothing else
+├── workers/dispatch/          the dispatcher process (a ONE-SHOT, on a timer)
 │   ├── dispatch.schema.ts     ports + row types (a leaf)
-│   ├── dispatch.service.ts    sweepOnce() — a pure function over the ports
-│   ├── dispatch.archive.ts    the two SELECTs against signal_log
-│   └── dispatch.runner.ts     the self-pacing loop + entry point
+│   ├── dispatch.service.ts    runOnce() — a pure function over the ports
+│   ├── dispatch.archive.ts    the ONE SELECT against signal_log
+│   └── dispatch.runner.ts     one run, then exit + entry point
 ├── utils/
 │   ├── envelope.ts            the public v1 envelope + the ErrorReason union
 │   └── errors.ts              AppError + subclasses, each carrying a reason
@@ -83,14 +86,30 @@ src/
 | --- | --- |
 | `npm run up` | one-shot setup: `.env`, containers, topic, ClickHouse schema |
 | `npm run dev` | `tsx watch` — the edge, pretty logs |
-| `npm run dispatch` | the dispatcher loop; needs `INTERNAL_SETTLE_SECRET` |
+| `npm run dispatch` | ONE dispatch run, then exits; needs `INTERNAL_SETTLE_SECRET` |
 | `npm run typecheck` | uses `tsconfig.json`, which **includes** test files |
+| `npm run typecheck:scripts` | `scripts/**/*.mts` too — they are NOT in `tsconfig.json` |
 | `npm run build` | uses `tsconfig.build.json`, which **excludes** `*.test.ts` |
 | `npm start` | runs compiled `dist/server.js` |
-| `npm test` | `node --import tsx --test` — 47 tests, no infrastructure needed |
-| `npm run e2e` | 110 checks against live Kafka + ClickHouse + Postgres |
+| `npm test` | `node --import tsx --test` — 59 tests, no infrastructure needed |
+| `npm run e2e` | the full pipeline against live Kafka + ClickHouse + Postgres |
 | `npm run loadtest` | the generator in `scripts/loadtest.mjs` |
 | `npm run down` | stop the containers (`-v` also wipes the ClickHouse volume) |
+
+Four scripts read the live pipeline rather than asserting against it. They **assert
+nothing and never fail** — they exist so the pipeline can be read instead of
+reasoned about. All four borrow a real API key row the way `npm run e2e` does, and
+restore it in a `finally`:
+
+| Command | What it shows |
+| --- | --- |
+| `npm run trace` | ONE signal through every hop — the exact SQL, the exact HTTP payloads, the exact rows |
+| `npm run trace:all` | one signal per route and outcome, printed as the matrix in ARCHITECTURE.md |
+| `npm run trace:runner` | the dispatcher **as a real process**, not `runOnce` called by hand — what a one-shot does and what exit code it leaves |
+| `npm run send:100` | 100 real signals end to end, reporting what each hop did |
+
+`send:100` deletes everything it writes **except the credit balance it draws
+down** — that is real consumption against a real org.
 
 Run a single test file:
 
@@ -159,6 +178,11 @@ knows, and restores it in a `finally` — writing the original to a recovery fil
   `new Date()` parses that as *local* time. Billing windows cut on `receivedAt`,
   so `toIso()` in `dispatch.service.ts` is load-bearing: a dispatcher in IST
   would otherwise bill every signal 5½ hours early.
+- **Never window over `received_at`.** It is the caller's time, stamped by N edge
+  instances off N clocks, and a row can land in ClickHouse minutes later — the
+  Kafka engine flushes in batches. With no watermark anywhere in the pipeline, a
+  window over `received_at` drops such a row permanently and silently. Window over
+  `ingested_at`; bill on `received_at`.
 - **`createMany` is all-or-nothing.** One bad row losing a whole batch's
   bookkeeping is not cosmetic here: with no status rows the dispatcher's
   watermark never advances, so it re-sends the same signals forever. Fail soft
@@ -171,10 +195,14 @@ knows, and restores it in a `finally` — writing the original to a recovery fil
 Test services as plain functions; test routes through `inject`. Always
 `await app.close()` in a test that builds an app.
 
-The dispatcher follows the same shape: `sweepOnce(deps)` is a pure function over
+The dispatcher follows the same shape: `runOnce(deps)` is a pure function over
 two narrow ports (`ArchiveReader`, `SettleClient`) declared in
 `dispatch.schema.ts`, so a test hands it fakes and the runner binds the real
 clients. Never reach for a driver inside the service.
+
+`scripts/**/*.mts` are **not** in `tsconfig.json`, so `npm run typecheck` does not
+see them — `npm run typecheck:scripts` does. Run it after changing anything the
+e2e harness imports, or a stale reference sits there until it fails at runtime.
 
 ## The wire contract
 
@@ -282,44 +310,56 @@ objects, in `docker/clickhouse/init/01-schema.sql`:
 - **`api_key_hash` is lifted into its own column** rather than left in the
   payload, because it is ours, not the caller's — `payload` must stay
   byte-for-byte what was sent.
+- **`ingested_at` carries a `minmax` skip index**, because the dispatcher's window
+  is over it and it is neither the `ORDER BY` key nor the partition key — without
+  the index that window is a full scan of every partition, reading the fat
+  `payload` column. Inserts arrive in roughly `ingested_at` order, so granule
+  ranges stay tight.
 
 ## The dispatcher
 
-`src/workers/dispatch/`. Reads the archive, posts to settle. Its contract with
-the payments app is three routes, all guarded by `INTERNAL_SETTLE_SECRET`:
+`src/workers/dispatch/`. **A one-shot on a 60-second systemd timer, not a loop
+and not a long-lived process.** One run is:
 
-| Call | Purpose |
-| --- | --- |
-| `GET /api/internal/signals/cursor` | the watermark, plus the signals due for a retry |
-| `POST /api/internal/signals/known` | of these ids, which already have a status row |
-| `POST /api/internal/settle` | settle a batch of ≤ 500 |
+1. one ClickHouse query for everything **ingested** in the last `DISPATCH_WINDOW_MS`
+2. one gzipped POST of all of it to `/api/internal/settle`
+3. one log line, then exit
 
-**Why there is no claim, no lease and no cursor table.** `SignalLog.signalId` is
-`UNIQUE` and settle passes it as the idempotency key, so a signal sent twice
-replays onto the original money row instead of charging again. The dispatcher
-therefore only has to guarantee **at least once** — over-sending costs a cheap
-replay. Two dispatchers running at once are safe rather than a corruption bug.
+Its whole contract with the payments app is that one route, guarded by
+`INTERNAL_SETTLE_SECRET`. There is no cursor route and no known route any more.
 
-**What is still outstanding lives in Postgres, not ClickHouse**, which has no row
-updates and so records no outcome. `SignalStatus` is the ledger and the Signals
-UI's read model at the same time.
+**There is NO state of any kind** — no watermark, no cursor, no claim, no lease,
+no local file. `SignalLog.signalId` is `UNIQUE` and settle uses it as the
+idempotency key, so a signal sent twice replays onto the original money row
+instead of charging again. That one fact is what pays for everything below.
 
-Three details that are load-bearing:
+Four things that are load-bearing:
 
-- **The overlap window.** The sweep reads *below* the watermark by
-  `DISPATCH_OVERLAP_MS`, because the Kafka engine flushes in batches and several
-  edge instances stamp `receivedAt` from their own clocks — a row can appear with
-  a timestamp just under one already seen. Reading strictly forward loses it,
-  silently and permanently.
-- **…and the filter that stops it looping.** Without `known`, every signal in
-  that window is re-sent on every sweep. Correct (settle dedups) and ruinous: a
-  caught-up pipeline would never go idle. Retries are exempt from the filter —
-  they always have a status row, so filtering them would make retries impossible.
-- **Batch size buys nothing; concurrency does.** Settle splits a batch across
-  `INTERNAL_WORKER` workers that each walk their chunk one signal at a time, so a
-  5,000-signal batch is the same rate with ten times the blast radius on a
-  timeout. `DISPATCH_BATCH_SIZE=500` (settle's own enforced cap),
-  `DISPATCH_CONCURRENCY=2`.
+- **The window is over `ingested_at`, NEVER `received_at`.** `received_at` is the
+  caller's time, stamped by N edge instances off N clocks, and a row can land in
+  ClickHouse minutes after it — the Kafka engine flushes in batches, and a broker
+  backlog delays it further. With no watermark, a window over `received_at` misses
+  such a row **permanently**. `ingested_at` is `DEFAULT now64(3)`: one clock, one
+  server, "arrived in the archive". `received_at` is still what settle bills on.
+- **The lower bound is computed by ClickHouse**, from its own `now64(3)`, not by
+  the dispatcher. `ingested_at` is stamped by the ClickHouse clock, so comparing
+  it against a bound off the EC2 box's clock would shift the window by whatever
+  skew exists between two machines — silently.
+- **The overlap IS the error recovery.** The window is 3× the timer's interval, so
+  every signal is sent about three times and settle discards the duplicates. A run
+  that fails leaves nothing behind to resume from; it is simply covered by the next
+  two. What that cannot cover is three consecutive failures, which is what the
+  hourly reconciliation timer (a 2-hour window, same binary) is for.
+- **`run.capped` means rows were lost.** `DISPATCH_MAX_ROWS` is an OOM guard, not
+  a batch size. Hitting it means the window held more than one run will carry and
+  the next window has already moved past some of them. Alarm on it.
+
+**One call, whatever the size.** No batch size, no concurrency, no chunking. The
+body is **gzipped**, which is not an optimisation: Vercel caps a serverless
+function's request body at 4.5MB and raw signal JSON crosses that at roughly 15k
+signals. Signal JSON compresses about 10:1. `dispatch.body_near_limit` warns
+before the ceiling, because crossing it is a hard 413 for the whole window at
+once.
 
 **A caller cannot forge the envelope.** `toSettleSignal` spreads the payload
 first and writes `signalId` / `receivedAt` / `apiKeyHash` / `attempt` over it, and
@@ -327,14 +367,21 @@ first and writes `signalId` / `receivedAt` / `apiKeyHash` / `attempt` over it, a
 forwarding a body-supplied organisation id let a caller bill another tenant
 (see BUG-1 in [docs/FINDINGS.md](docs/FINDINGS.md)).
 
-**The loop is self-pacing** (`dispatch.runner.ts`): a full batch goes round again
-immediately, a short one naps `DISPATCH_IDLE_MS`. A cron can do neither — it adds
-latency when idle and cannot catch up when behind.
+**Exit codes are the interface**: `0` sent or nothing to send, `1` transient (the
+next tick is the retry — there is no backoff in here), `2` misconfigured (every
+tick will fail identically until a human acts). Units and alerts:
+[deploy/systemd/README.md](deploy/systemd/README.md).
 
-**Retry policy**, copied from the payments app's existing
-`/api/cron/usage-logs/process`: retry a signal that never errored (the crash
-case) or that last failed with `SERVER_ERROR`; **never** a `USER_ERROR`, which
-cannot self-heal and waits for a fix and a manual retry; stop at 5 attempts.
+**Retry policy now belongs to settle**, not here. The window re-sends everything
+regardless of outcome, so settle must: re-process a `SERVER_ERROR`, no-op a
+`PROCESSED`, and **never** retry a `USER_ERROR` (it cannot self-heal and waits for
+a fix). Get that predicate wrong and either every transient failure becomes
+permanent, or the whole window is re-priced every minute.
+
+**Filling a gap**: `DISPATCH_SINCE` / `DISPATCH_UNTIL` read an explicit
+`[since, until)` over `ingested_at` instead of the relative window. That is the
+manual replay tool for an outage longer than the reconciliation window — no code
+change, and no cursor to rewind.
 
 ## Configuration
 
@@ -346,22 +393,57 @@ Edge: `KAFKA_BROKERS` (empty = do not produce), `KAFKA_TOPIC`, `KAFKA_CLIENT_ID`
 
 Dispatcher: `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`,
 `CLICKHOUSE_PASSWORD`, `PAYMENTS_URL`, `INTERNAL_SETTLE_SECRET` (required — it
-refuses to start without one), `DISPATCH_BATCH_SIZE`, `DISPATCH_CONCURRENCY`,
-`DISPATCH_IDLE_MS`, `DISPATCH_OVERLAP_MS`.
+exits 2 without one), `DISPATCH_WINDOW_MS` (how far back, over `ingested_at`;
+keep it a multiple of the timer's interval), `DISPATCH_MAX_ROWS` (an OOM guard —
+hitting it loses rows), `DISPATCH_TIMEOUT_MS` (must exceed settle's
+`maxDuration`), `DISPATCH_GZIP`, and `DISPATCH_SINCE` / `DISPATCH_UNTIL` for a
+manual replay.
 
 ## Repository state
 
-- Branch `Simple-version`. The last commit predates the dispatcher — the pipeline
-  described here is **uncommitted working-tree state**.
+- Branch `Simple-version`, last commit `84db9ca`. The dispatcher **is** committed;
+  what is still uncommitted is its 1.0 rewrite plus everything around it. Untracked
+  and therefore invisible to `git show HEAD:`: `deploy/systemd/`,
+  `docker/clickhouse/migrations/` (both `002` and `003`), `docs/AWS-SETUP.md`,
+  `docs/COSTS.md`, `docs/setup.md`, `scripts/send-100.mts`, `tsconfig.scripts.json`,
+  and the `payments-client` / `dispatch.archive` test files. Modified on top of
+  HEAD: the whole `src/workers/dispatch/` tree, `src/config.ts`,
+  `src/plugins/kafka.ts`, `src/client/payments-client.ts`, every doc, and the e2e
+  scripts.
 - **No SQS, no Lambda, no Redis, no Prisma, and no reject vent.** Earlier versions
   had all of them; `git show HEAD:` still has the files if you need the history.
   Do not reintroduce them from AGENTS.md's stale tree.
-- **`infra/`** holds only `provider.tf`, a README and Terraform state. The queue
-  and Lambda definitions were deleted with the SQS pipeline; the AWS wiring that
-  replaces them is described, not yet provisioned — see
-  [docs/PRODUCTION.md](docs/PRODUCTION.md).
-- **The topic is on ONE partition.** That means one consumer of order, no
-  consumer-side HA, and head-of-line blocking. Repartitioning later moves
-  key→partition placement, so it should be decided before production.
+- **`infra/` is retired and `infra/aws/` replaces it.** The old root provisioned
+  the LocalStack SQS/Lambda pipeline; its `queues.tf`/`lambdas.tf`/`variables.tf`
+  went with that pipeline, and its `provider.tf` is deleted too (it referenced
+  variables that no longer existed, so `terraform init` failed on it). Its two
+  `terraform.tfstate` files still describe nine LocalStack resources and are left
+  in place, untracked and unread — never reuse that lineage against a real
+  account. `infra/aws/` is a SEPARATE root pointed at real AWS: it *reads* the
+  existing VPC, subnets, `event-tasks` SG and MSK cluster as data sources and
+  owns only the edge's IAM role, deploy bucket, instance, ALB and one ingress
+  rule. `terraform validate` passes; it has never been applied. See
+  [infra/aws/README.md](infra/aws/README.md) and
+  [docs/setup.md](docs/setup.md).
+- **`deploy/systemd/`** holds the two timer units that run the dispatcher — the
+  1-minute pipeline run and the hourly reconciliation. They are the deployment;
+  there is no supervised long-lived dispatcher process any more.
+- **The dispatcher's 1.0 rewrite assumes two payments-side changes**: settle must
+  accept one call of arbitrary size (its 500 cap gone, its per-signal walk
+  replaced by a bulk insert), and it must decompress a gzipped request body. Until
+  both land, `npm run e2e` cannot pass.
+- **The topic is on ONE partition**, and grows to 3 only on a measured symptom
+  (ClickHouse ingestion lagging, or head-of-line blocking) — see
+  [docs/AWS-SETUP.md](docs/AWS-SETUP.md) Step 0. Growing is **cheap here**, which
+  is unusual: adding partitions rehashes `customerId`→partition and splits a
+  customer's ordered stream, but nothing in this pipeline reads the topic in
+  order — `signal_log` is `ORDER BY (received_at, signal_id)` and dedups on
+  `signal_id`, the dispatcher windows on `ingested_at`, settle is idempotent on
+  `signalId`. Do not repeat the usual "ordering breaks" warning as if it applied.
+  The one real hazard is a new partition starting at `latest` and silently
+  skipping whatever the producer wrote before the consumer rebalanced onto it,
+  which is why **`kafka_auto_offset_reset = 'earliest'`** is set on
+  `kafka_signals` (migration `003`) — it must be in place *before* the topic
+  grows. Partition count can never be lowered.
 - No linter or formatter is configured. `npm run typecheck` is the only static
   gate.

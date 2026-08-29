@@ -3,8 +3,10 @@ dist/
 dist-lambda/
 
 # terraform: local state, provider plugins, plans. The .tf files ARE committed.
-infra/.terraform/
-infra/.terraform.lock.hcl
+# Recursive, because there is more than one root now (infra/aws/) and an
+# unanchored .terraform/ holds a ~600MB provider binary.
+**/.terraform/
+**/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan
@@ -18,3 +20,6 @@ infra/.terraform.lock.hcl
 # LocalStack's runtime state, recreated on every container start. Holds the
 # generated root CA and server private keys, and the license file.
 volume/
+
+# The build artifact infra/aws uploads to S3. Rebuilt on demand, never committed.
+signal-edge.tar.gz
