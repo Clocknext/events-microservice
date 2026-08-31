@@ -44,9 +44,10 @@ services:
       timeout: 5s
       retries: 12
 
-  # ClickHouse ingests from Kafka itself (Kafka table engine + materialized view,
-  # see docker/clickhouse/init) — there is no consumer process. It reaches the
-  # broker over the compose network at kafka:29092.
+  # ClickHouse no longer ingests from Kafka itself. `npm run consume` drains the
+  # topic, resolves every signal against the payments app, and writes the row with
+  # its verdict — a materialized view could never make that HTTP call. ClickHouse
+  # is now only a destination, and reaches no broker at all.
   clickhouse:
     container_name: clickhouse
     image: clickhouse/clickhouse-server:25.3

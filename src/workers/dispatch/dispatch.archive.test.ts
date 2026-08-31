@@ -95,6 +95,35 @@ test('rows come back oldest-ingested first, and payload is selected raw', async 
   assert.match(sql, /ORDER BY ingested_at ASC/)
   // Never `toString(received_at) AS received_at`: ClickHouse resolves a SELECT
   // alias inside WHERE, and the query dies comparing String to DateTime64.
-  assert.match(sql, /SELECT signal_id, received_at, api_key_hash, payload/)
+  assert.match(
+    sql,
+    /SELECT signal_id, received_at, api_key_hash, customer_id, organization_id, status, error_code, error_message, payload/,
+  )
   assert.doesNotMatch(sql, /toString\(/)
+})
+
+test('the newest version of a signal wins, and the cap drops the newest rows', async () => {
+  const { reader, seen } = spy()
+  await reader.readIngested({ windowMs: 180_000, cap: 100 })
+  const sql = flat(seen[0]!.sql)
+  // `signal_log` is ReplacingMergeTree(version): a row can be rewritten by
+  // re-inserting it higher. Nothing does that yet — the daily reconciliation cron
+  // will — and picking the newest has to be right BEFORE it does.
+  assert.match(sql, /ORDER BY signal_id, version DESC/)
+  assert.match(sql, /LIMIT 1 BY signal_id/)
+  // Two different orderings, so they cannot share one level. The outer one is
+  // load-bearing: the cap must drop the NEWEST rows, because those are the ones
+  // the next overlapping window still covers.
+  assert.ok(sql.indexOf('ORDER BY signal_id, version DESC') < sql.indexOf('ORDER BY ingested_at ASC'))
+  assert.ok(sql.indexOf('ORDER BY ingested_at ASC') < sql.indexOf('LIMIT {cap:UInt32}'))
+})
+
+test('both statuses come back — a PENDING signal is never filtered out', async () => {
+  const { reader, seen } = spy()
+  await reader.readIngested({ windowMs: 180_000, cap: 100 })
+  const sql = flat(seen[0]!.sql)
+  // Rejected signals still go to settle, which records the terminal failure the
+  // consumer already decided. Filtering here would leave them with no Postgres
+  // row at all — invisible in the Signals UI.
+  assert.doesNotMatch(sql, /status\s*=/)
 })

@@ -195,14 +195,22 @@ done
 shopt -u nullglob
 
 missing=$(ch -q "SELECT arrayStringConcat(arrayFilter(x -> NOT has(groupArray(name), x),
-                   ['signal_id','received_at','api_key_hash','payload']), ', ')
+                   ['signal_id','received_at','api_key_hash','customer_id','organization_id',
+                    'status','error_code','error_message','payload','version']), ', ')
                  FROM system.columns WHERE database='$CH_DB' AND table='signal_log'" 2>/dev/null || echo '?')
 [ -z "$missing" ] || die "signal_log is missing columns: $missing"
-ok "columns: signal_id · received_at · api_key_hash · payload"
+ok "columns: identity · verdict (organization_id · status · error_*) · payload · version"
 
-for obj in kafka_signals signal_log signal_log_mv; do
-  [ "$(ch -q "EXISTS TABLE $CH_DB.$obj" 2>/dev/null || echo 0)" = "1" ] \
-    && ok "$obj" || die "$CH_DB.$obj is missing"
+# ONE table now. ClickHouse no longer ingests from Kafka itself — `kafka_signals`
+# and `signal_log_mv` are gone, replaced by src/workers/consume/, because a
+# materialized view cannot make the HTTP call that resolves a signal.
+[ "$(ch -q "EXISTS TABLE $CH_DB.signal_log" 2>/dev/null || echo 0)" = "1" ] \
+  && ok "signal_log" || die "$CH_DB.signal_log is missing"
+
+for gone in kafka_signals signal_log_mv; do
+  [ "$(ch -q "EXISTS TABLE $CH_DB.$gone" 2>/dev/null || echo 0)" = "1" ] \
+    && warn "$gone still exists — migration 005 has not run; TWO writers would race" \
+    || ok "$gone is gone"
 done
 ok "archive holds $(ch -q "SELECT count() FROM $CH_DB.signal_log") row(s)"
 

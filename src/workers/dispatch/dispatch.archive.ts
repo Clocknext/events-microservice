@@ -15,6 +15,19 @@ import type { ArchiveReader, SignalLogRow } from './dispatch.schema.js'
  *  same signal twice. */
 const DEDUPE = 'LIMIT 1 BY signal_id'
 
+/** Which duplicate `LIMIT 1 BY` keeps.
+ *
+ *  `signal_log` is `ReplacingMergeTree(version)`, so a row can be REWRITTEN by
+ *  re-inserting it at a higher version. Nothing does that today — the consumer
+ *  always writes 1 — but the daily reconciliation cron will, and picking the
+ *  newest version has to be right before it does, not after.
+ *
+ *  It is also why the whole thing needs a subquery: `LIMIT 1 BY` takes the first
+ *  row per key in the CURRENT ordering, so choosing the newest version and
+ *  returning rows oldest-first are two different ORDER BYs and cannot share one
+ *  level. The outer ordering is not cosmetic either — see the LIMIT below. */
+const NEWEST_VERSION = 'ORDER BY signal_id, version DESC'
+
 /** The columns, in the shape `SignalLogRow` expects.
  *
  *  `received_at` is selected RAW, with no `toString()`. That is not a style
@@ -25,9 +38,20 @@ const DEDUPE = 'LIMIT 1 BY signal_id'
  *  plainly avoids the shadowing entirely — and JSONEachRow already renders a
  *  DateTime64(3) as `YYYY-MM-DD hh:mm:ss.sss`, which is what `toIso` converts.
  *
- *  `ingested_at` is selected by nobody: it decides WHICH rows come back and is
- *  not part of the signal. */
-const COLUMNS = 'signal_id, received_at, api_key_hash, payload'
+ *  `ingested_at` is not in this list because it is not part of the signal. The
+ *  INNER query below still selects it — the outer ordering needs it — but it is
+ *  projected away before the rows reach `SignalLogRow`. */
+const COLUMNS = [
+  'signal_id',
+  'received_at',
+  'api_key_hash',
+  'customer_id',
+  'organization_id',
+  'status',
+  'error_code',
+  'error_message',
+  'payload',
+].join(', ')
 
 export function createArchiveReader(clickhouse: ClickHouseReader): ArchiveReader {
   return {
@@ -60,12 +84,25 @@ export function createArchiveReader(clickhouse: ClickHouseReader): ArchiveReader
         // that consecutive runs overlap and nothing can fall between them.
       }
 
+      // Both statuses come back. PENDING rows are NOT filtered out: they still go
+      // to settle, which records the terminal failure the consumer already
+      // decided. Dropping them here would leave a rejected signal with no row in
+      // Postgres at all — invisible in the Signals UI, with its reason readable
+      // only by querying ClickHouse directly.
+      //
+      // The outer `ORDER BY ingested_at ASC` before `LIMIT {cap}` is load-bearing:
+      // the cap must drop the NEWEST rows, because those are the ones the next
+      // overlapping window still covers. Dropping the oldest would lose them.
       return clickhouse.query<SignalLogRow>(
         `SELECT ${COLUMNS}
-           FROM signal_log
-          WHERE ${clauses.join(' AND ')}
+           FROM (
+             SELECT ${COLUMNS}, ingested_at
+               FROM signal_log
+              WHERE ${clauses.join(' AND ')}
+              ${NEWEST_VERSION}
+              ${DEDUPE}
+           )
           ORDER BY ingested_at ASC
-          ${DEDUPE}
           LIMIT {cap:UInt32}`,
         params,
       )

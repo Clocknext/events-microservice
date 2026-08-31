@@ -13,6 +13,7 @@
     "test:watch": "node --import tsx --test --watch",
     "loadtest": "node scripts/loadtest.mjs",
     "dispatch": "tsx --env-file-if-exists=.env src/workers/dispatch/dispatch.runner.ts",
+    "consume": "tsx --env-file-if-exists=.env src/workers/consume/consume.runner.ts",
     "e2e": "tsx scripts/e2e.mts",
     "send:100": "tsx scripts/send-100.mts",
     "trace": "tsx scripts/e2e/trace.mts",

@@ -1,0 +1,23 @@
+-- 005 — ClickHouse stops consuming Kafka.
+--
+-- `signal_log_mv` is already gone (migration 004). This drops the stream table it
+-- read from. After this, nothing in ClickHouse talks to a broker: the topic is
+-- drained by src/workers/consume/, which resolves each signal against payments
+-- before archiving it.
+--
+-- RUN THIS ONLY AFTER the new consumer group's offsets have been seeded from
+-- `clickhouse-signal-log`. A fresh group has no committed offsets, so it starts
+-- wherever `auto.offset.reset` says — and both answers are wrong here:
+--
+--   earliest  re-reads the whole topic and re-resolves every historical signal,
+--             one HTTP call each.
+--   latest    silently skips everything produced between the drop and the new
+--             consumer's first poll.
+--
+-- Seeding is the only correct answer. docs/AWS-SETUP.md Step 12 has the commands.
+--
+-- Dropping this table does NOT delete the old group's committed offsets from the
+-- broker — they survive until the broker's own retention expires, so the seeding
+-- step can still read them after this runs. Do not rely on that; seed first.
+
+DROP TABLE IF EXISTS signals.kafka_signals;

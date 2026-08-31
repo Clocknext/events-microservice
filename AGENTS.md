@@ -10,17 +10,21 @@ wire contract, and every outcome a signal can have — see
 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md). This file is about where code
 goes, not what it means.
 
-## Two processes, one codebase
+## Three processes, one codebase
 
 | | Entry point | What it is |
 | --- | --- | --- |
 | **the edge** | `src/server.ts` | a Fastify service. `POST /api/v1/signal` — gate, stamp, produce to Kafka, 202 |
+| **the consumer** | `src/workers/consume/consume.runner.ts` | LONG-LIVED. Drains the topic, calls `/api/internal/resolve` once per signal, writes the row **and its verdict** to ClickHouse. Replaced ClickHouse's own Kafka ingestion, which could not make an HTTP call |
 | **the dispatcher** | `src/workers/dispatch/dispatch.runner.ts` | a ONE-SHOT on a 60s timer. Reads one window of the ClickHouse archive, posts all of it to the payments app in a single call, exits |
 
-They share `config.ts` and nothing else. The dispatcher imports **no plugin and
-no Fastify**; the edge imports **nothing under `client/`**. Keep it that way — the
-moment the edge opens a ClickHouse connection, or the dispatcher reaches for
-`app.*`, the split stops being real.
+They share `config.ts` and nothing else. Both workers import **no plugin and no
+Fastify**; the edge imports **nothing under `client/`**. Keep it that way — the
+moment the edge opens a ClickHouse connection, or a worker reaches for `app.*`,
+the split stops being real.
+
+The consumer is the only worker that is a systemd **service**. A Kafka consumer
+group member that started and exited every 60s would rebalance instead of drain.
 
 ## File structure
 
@@ -43,10 +47,16 @@ root
     │   ├── error-handler.ts     AppError -> the v1 envelope
     │   ├── identity.ts          stamps signalId + receivedAt at onRequest
     │   └── kafka.ts             decorates app.producer (SignalProducer | null)
-    ├── client/                  outbound HTTP — DISPATCHER ONLY, never the edge
-    │   ├── clickhouse.ts        read-only reader (HTTP + JSONEachRow)
-    │   └── payments-client.ts   cursor / known / settle
-    ├── workers/dispatch/        the dispatcher process
+    ├── client/                  outbound HTTP — THE WORKERS ONLY, never the edge
+    │   ├── clickhouse.ts        reader (dispatcher) + writer (consumer)
+    │   ├── resolve-client.ts    resolveSignal() — ok | rejected | transient
+    │   └── payments-client.ts   settleAll()
+    ├── workers/consume/         the consumer process (a SERVICE, always on)
+    │   ├── consume.schema.ts    ports + row types (a leaf)
+    │   ├── consume.service.ts   processBatch() — a pure function over the ports
+    │   ├── consume.archive.ts   the ONE INSERT into signal_log
+    │   └── consume.runner.ts    kafkajs wiring + entry point
+    ├── workers/dispatch/        the dispatcher process (a ONE-SHOT, on a timer)
     │   ├── dispatch.schema.ts   ports + row types (a leaf)
     │   ├── dispatch.service.ts  runOnce() — a pure function over the ports
     │   ├── dispatch.archive.ts  the ONE SELECT against signal_log
@@ -129,11 +139,16 @@ Dependency direction is one-way: `module → routes → controller → service`.
   not a util.
 - **Config only from [src/config.ts](src/config.ts).** No `process.env` reads
   anywhere else. Nothing loads a `.env` file — pass vars via the environment.
-- **`client/` is the dispatcher's.** The edge must not import from it. The edge's
-  only outbound dependency is Kafka, via `plugins/kafka.ts`.
-- **`signal_log` is read-only to this codebase.** It has exactly one writer, the
-  ClickHouse materialized view. A second writer would put rows in the archive
-  that replaying the topic could not reproduce.
+- **`client/` is the workers'.** The edge must not import from it. The edge's only
+  outbound dependency is Kafka, via `plugins/kafka.ts`.
+- **`signal_log` has exactly ONE writer, and it is `workers/consume/`.** Everything
+  else — the dispatcher, the traces, the e2e harness — only reads. Keeping the
+  ClickHouse *reader* and *writer* as two separate exports is what makes "who can
+  write to the archive" answerable by grep.
+- **The archive is no longer reproducible by replaying the topic**, because a row
+  carries a verdict that came from an HTTP call. Do not repeat the old
+  "rebuildable by replay" claim; it was true when a materialized view was the
+  writer.
 
 ## Adding a module
 

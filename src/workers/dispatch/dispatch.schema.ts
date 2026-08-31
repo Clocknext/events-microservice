@@ -24,7 +24,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // What ClickHouse holds
 
-/** One row of `signals.signal_log`, as the dispatcher selects it. */
+/** One row of `signals.signal_log`, as the dispatcher selects it.
+ *
+ *  The last five columns are the CONSUMER's verdict, written when the signal was
+ *  archived rather than derived here. Everything before them is the caller's and
+ *  the edge's. */
 export interface SignalLogRow {
   signal_id: string
   /** ClickHouse renders DateTime64(3) as `YYYY-MM-DD hh:mm:ss.SSS` — a space,
@@ -33,6 +37,20 @@ export interface SignalLogRow {
   /** SHA-256 digest of the caller's key. `''` on rows written before the edge
    *  started stamping it — the column is non-Nullable. */
   api_key_hash: string
+  /** A lifted copy of the payload's `customerId`. The payload still holds its
+   *  own; this exists so the archive can be queried without JSON extraction. */
+  customer_id: string
+  /** OURS, resolved by the consumer against `/api/internal/resolve`. `''` on a
+   *  row whose key never resolved, and on rows archived before the consumer
+   *  existed — settle falls back to `api_key_hash` for both. */
+  organization_id: string
+  /** `PROCESSING` (price it), `PENDING` (record the failure, price nothing) or
+   *  `SUCCESS` (already settled; written only by the daily reconciliation cron). */
+  status: string
+  /** Machine-readable, from payments. `''` when the signal was accepted. */
+  error_code: string
+  /** The human sentence payments gave. `''` when the signal was accepted. */
+  error_message: string
   /** The caller's body, verbatim, as JSON text. */
   payload: string
 }
@@ -45,8 +63,20 @@ export interface SignalLogRow {
 export interface SettleSignal {
   signalId: string
   receivedAt: string
-  /** How the organisation is resolved. The raw key is never sent. */
+  /** Kept for audit, and as settle's fallback for a row archived before the
+   *  consumer existed. The raw key is never sent. */
   apiKeyHash: string
+  /** The organisation the CONSUMER resolved, which settle trusts rather than
+   *  re-deriving. `''` when the key never resolved — settle's
+   *  `SignalStatus.organizationId` is nullable for exactly that case. */
+  organizationId: string
+  /** What settle should DO with this signal, decided upstream:
+   *  `PROCESSING` price it; `PENDING` record the terminal failure below and
+   *  price nothing. */
+  status: string
+  /** Present only on a `PENDING` signal. */
+  errorCode: string | null
+  errorMessage: string | null
   /** Always 1. Nothing on THIS side counts attempts any more — the dispatcher
    *  keeps no state, so it cannot know which delivery this is. The attempt count
    *  belongs to `SignalStatus`, which is the side that can actually see it. */
@@ -88,8 +118,9 @@ export interface ArchiveReader {
    *
    * The window is over `ingested_at` and never `received_at`. `received_at` is
    * the caller's time, stamped by N edge instances off N clocks, and a row can
-   * land here minutes after it — the Kafka engine flushes in batches, and a
-   * broker backlog delays it further. A window over `received_at` would miss
+   * land here minutes after it — the consumer batches, resolves each signal over
+   * HTTP, and a broker backlog delays it further. A window over `received_at`
+   * would miss
    * every such row PERMANENTLY, because nothing persists a watermark to come
    * back for it. `ingested_at` is one clock on one server and means "arrived in
    * the archive", which is what this run needs to mean by "the latest data".
@@ -123,6 +154,9 @@ export interface RunOutcome {
   /** Rows the archive held but that could not be turned into a signal. */
   skipped: number
   processed: number
+  /** Arrived already rejected by the consumer — a bad key, a body that failed
+   *  the rulebook, an unknown customer. Settle records these and prices nothing. */
+  pending: number
   /** Refused for good — the caller must change something. Never retried. */
   userError: number
   /** Ours. Re-sent by the next overlapping window, and by the hourly

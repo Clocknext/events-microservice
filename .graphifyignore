@@ -1,0 +1,28 @@
+# Extra excludes for `graphify`, on top of .gitignore (which it already respects,
+# and which already covers node_modules/, dist/, dist-lambda/, volume/,
+# **/.terraform/, *.tfstate*, .env and signal-edge.tar.gz).
+#
+# .graphifyignore is evaluated LAST and wins on conflicts. .gitignore syntax.
+
+# Dependencies and build output — restated explicitly rather than relying only on
+# .gitignore, since --no-gitignore would otherwise pull all of it in.
+node_modules/
+dist/
+dist-lambda/
+
+# A 10k-line dependency manifest. No architecture in it, and it would dominate
+# the graph with package nodes that have nothing to do with this codebase.
+package-lock.json
+
+# Terraform provider binaries (~600MB) and local state describing the retired
+# LocalStack pipeline — deliberately not part of how this project works.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+
+# LocalStack runtime leftovers: a generated root CA and server private keys.
+volume/
+
+# The build artifact uploaded to S3, and graphify's own output.
+signal-edge.tar.gz
+graphify-out/

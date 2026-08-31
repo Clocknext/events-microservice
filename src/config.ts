@@ -39,12 +39,17 @@ export const config = {
   /** Region used to sign the IAM auth token. Only read when `kafkaUseIam`. */
   awsRegion: process.env.AWS_REGION ?? 'us-east-1',
 
-  // --- clickhouse (read-only, dispatcher only) --------------------------------
-  // The EDGE still never touches ClickHouse — it produces to Kafka and ClickHouse
-  // ingests on its own (Kafka table engine + materialized view, see
-  // docker/clickhouse/init). These keys are for the DISPATCHER, a separate
-  // process that READS the archive and posts batches to the payments app. It
-  // never writes: `signal_log` has exactly one writer, the materialized view.
+  // --- clickhouse (the two workers; never the edge) ---------------------------
+  // The EDGE still never touches ClickHouse — it produces to Kafka and nothing
+  // else. These keys are read by two separate processes:
+  //
+  //   the CONSUMER   writes. It drains the topic itself, resolves each signal
+  //                  against payments, and archives the row WITH that verdict.
+  //   the DISPATCHER reads. One window per run, posted to /api/internal/settle.
+  //
+  // `signal_log` still has exactly ONE writer — it is the consumer now, not the
+  // materialized view, which is gone along with the Kafka table engine. A
+  // materialized view cannot make an HTTP call, which is why it had to go.
   clickhouseUrl: process.env.CLICKHOUSE_URL ?? 'http://127.0.0.1:8123',
   clickhouseDatabase: process.env.CLICKHOUSE_DATABASE ?? 'signals',
   clickhouseUser: process.env.CLICKHOUSE_USER ?? 'default',
@@ -54,8 +59,14 @@ export const config = {
   /** Base URL of the payments app that owns pricing and Postgres. */
   paymentsUrl: process.env.PAYMENTS_URL ?? 'http://127.0.0.1:3001',
   /** Shared secret proving the CALLER is us, sent as `Authorization: Bearer`.
-   *  Not a customer credential — it authenticates this service, and both
-   *  `/api/internal/settle` and `/api/internal/signals/cursor` require it. */
+   *  Not a customer credential — it authenticates this service. Required by both
+   *  `/api/internal/resolve` (the consumer) and `/api/internal/settle` (the
+   *  dispatcher); each exits 2 without it.
+   *
+   *  It now also protects tenant ATTRIBUTION, not just access: settle trusts the
+   *  `organizationId` the consumer resolved instead of re-deriving it, so a leak
+   *  of this secret lets a caller name any organisation rather than merely replay
+   *  signals. Same trust boundary, larger blast radius. */
   internalSecret: process.env.INTERNAL_SETTLE_SECRET ?? '',
 
   // --- the dispatcher (the 1-minute cron) -------------------------------------
@@ -103,6 +114,44 @@ export const config = {
    *  code change or a cursor to rewind. */
   dispatchSince: process.env.DISPATCH_SINCE ?? '',
   dispatchUntil: process.env.DISPATCH_UNTIL ?? '',
+
+  // --- the consumer (Kafka -> resolve -> ClickHouse) --------------------------
+  //
+  // A LONG-LIVED process, unlike the dispatcher — a consumer group member that
+  // started and exited every 60s would spend its life rebalancing the group. It
+  // replaced ClickHouse's `ENGINE = Kafka` table and its materialized view,
+  // because neither can make the HTTP call that resolves a signal.
+  /** Consumer group id. Changing it makes a brand-new group with no committed
+   *  offsets, which then starts wherever `consumeFromBeginning` says — and
+   *  re-resolving the topic is one HTTP call per signal. Change it deliberately
+   *  or not at all. */
+  consumeGroupId: process.env.CONSUME_GROUP_ID ?? 'signal-resolver',
+  /** In-flight resolve calls per batch. THE throughput ceiling of this design:
+   *  every signal costs one HTTP round trip to a serverless function. Raising it
+   *  buys throughput until payments starts refusing connections. */
+  consumeConcurrency: intFromEnv('CONSUME_CONCURRENCY', 16),
+  /** Start a new group at the OLDEST offset instead of resuming. True only for a
+   *  deliberate full replay — it re-resolves every signal the topic still holds. */
+  consumeFromBeginning: (process.env.CONSUME_FROM_BEGINNING ?? '').toLowerCase() === 'true',
+  /** Timeout on ONE resolve call. Short on purpose: a slow call blocks a slot in
+   *  the concurrency pool, and a timeout is retryable — the message stays on the
+   *  topic. */
+  resolveTimeoutMs: intFromEnv('RESOLVE_TIMEOUT_MS', 10_000),
+  /** Consecutive transient failures on ONE signal, WHILE OTHER CALLS SUCCEED,
+   *  before it is archived as PENDING/`RESOLVE_FAILED` and stepped over.
+   *
+   *  Without this a single message that crashes the resolve route stalls the
+   *  entire topic behind it forever, because offsets are committed in order and
+   *  that one never becomes committable. */
+  resolvePoisonAfter: intFromEnv('RESOLVE_POISON_AFTER', 5),
+  /** Nothing at all has resolved successfully for this long -> payments is down,
+   *  not a poison message. The consumer exits 1, commits nothing, and systemd
+   *  backs off; the signals are safe on the topic meanwhile.
+   *
+   *  This is the other half of `resolvePoisonAfter`: on a low-traffic topic a
+   *  batch can be ONE message, where "every call failed" and "one poison message"
+   *  are the same observation. Time apart is what separates them. */
+  resolveOutageMs: intFromEnv('RESOLVE_OUTAGE_MS', 120_000),
 
   // --- request limits --------------------------------------------------------
   /** Reject bodies over this size (Fastify bodyLimit -> 413). */

@@ -18,18 +18,36 @@ customer
    ▼
 CloudFront ──▶ ALB ──▶ box-edge   t4g.small
                        ├─ edge      Fastify :3000
+                       ├─ consumer  systemd SERVICE — always on
                        └─ dispatch  systemd timers (1 min + hourly)
                             │ produce · private IP :9092
                             ▼
-                       box-kafka  t4g.small   kafka.yourdomain.com
+                       box-kafka  t4g.small
                        └─ Kafka   :9092 internal (VPC only)
-                                  :9094 public SASL_SSL
                             │
-                   ClickHouse Cloud pulls :9094
-                            │  signal_log
+                            │ the CONSUMER pulls it, from inside the VPC
+                            ▼
+              payments /api/internal/resolve   ← one call per signal:
+                            │                    whose key is this, and is
+                            │  the verdict       this body acceptable?
+                            ▼
+                    ClickHouse Cloud   signal_log
+                            │
                             ▼
         dispatcher reads the archive ──▶ payments /api/internal/settle
 ```
+
+> **ClickHouse no longer pulls from Kafka.** It used to, with an `ENGINE = Kafka`
+> table and a materialized view — which is why the broker had a public TLS
+> listener on 9094 and a SCRAM user for ClickHouse Cloud to authenticate with. A
+> materialized view cannot make an HTTP call, and every signal now needs one
+> before it is archived, so a real consumer process on **box-edge** does the
+> draining instead.
+>
+> That means **nothing outside the VPC connects to the broker any more.** If you
+> are following this guide from scratch, Steps 9, 10.2, 10.6 and 10.8 exist only
+> for that old path — see the note at Step 12. If you have already built them,
+> Step 17.4 decommissions them safely.
 
 ### Your scratch sheet
 
@@ -50,7 +68,7 @@ SG-EDGE ID              = sg-...............
 SG-KAFKA ID             = sg-...............
 ELASTIC IP              = ..................  (Step 6)
 BOX-KAFKA PRIVATE IP    = 10.................  (Step 7)
-KAFKA SCRAM PASSWORD    = ..................  (Step 10)
+KAFKA SCRAM PASSWORD    = ..................  (Step 10 — LEGACY, see Step 12)
 ALB DNS NAME            = ..........elb.amazonaws.com  (Step 14)
 CLOUDFRONT DOMAIN       = d.........cloudfront.net     (Step 15)
 INTERNAL_SETTLE_SECRET  = ..................
@@ -537,6 +555,11 @@ free -h        # the Swap row should now show 2.0Gi
 
 ## Step 9 — DNS record for the broker
 
+> **LEGACY — skip this on a fresh build.** This record exists so Let's Encrypt can issue a certificate for the broker's PUBLIC listener, which existed so ClickHouse Cloud could pull the topic. Nothing outside the VPC connects
+> to the broker any more: the consumer runs on box-edge and uses the private
+> `9092` listener. Step 12.1 has the full picture; Step 17.4 decommissions it if
+> you have already built it.
+
 1. GoDaddy → your domain → **DNS** → **Add New Record**:
 
 | Field | Value |
@@ -595,6 +618,11 @@ scripts. Java 11 or older will not run a Kafka 4.x broker at all.
 > for `controller.quorum.*`. Everything else here is stable across 4.x.
 
 ### 10.2 Get the TLS certificate
+
+> **LEGACY — skip this on a fresh build.** The certificate secures the public `9094` listener, whose only client was ClickHouse Cloud's Kafka engine. Nothing outside the VPC connects
+> to the broker any more: the consumer runs on box-edge and uses the private
+> `9092` listener. Step 12.1 has the full picture; Step 17.4 decommissions it if
+> you have already built it.
 
 ```bash
 sudo certbot certonly --standalone -d kafka.yourdomain.com
@@ -678,12 +706,15 @@ log.retention.bytes=-1
 > - **`EXTERNAL` must be `kafka.yourdomain.com`**, never an IP. The certificate was
 >   issued for that name, and the client checks that the name matches.
 >
-> Symptom of either mistake, seen later in Step 12: a live consumer that has read
-> **0** messages, with a connection error repeating every ~31 seconds.
+> Symptom of an `INTERNAL` mistake, seen in Step 11: the edge answers **502
+> `QUEUE_UNAVAILABLE`**, and in Step 13 the consumer cannot reach the broker either.
+> `EXTERNAL` no longer has a client at all — see Step 17.4.
 
 `default.replication.factor=1` because this is a single broker. Asking for more
 copies than you have brokers makes every topic creation fail outright. Durability
-here comes from ClickHouse's copy plus the 7-day retention above.
+here comes from ClickHouse's copy plus the 7-day retention above — and that
+retention now matters more than it did: while the consumer is down, the topic is
+the *only* place those signals exist.
 
 Cap Java's memory, or it will try to take most of your 2 GiB:
 
@@ -751,6 +782,11 @@ watching. If it crash-loops, the error is almost always a typo in
 `server.properties` — read the first exception, not the last.
 
 ### 10.6 Create the ClickHouse login
+
+> **LEGACY — skip this on a fresh build.** This SCRAM user is the credential ClickHouse Cloud authenticated with. ClickHouse no longer consumes Kafka at all. Nothing outside the VPC connects
+> to the broker any more: the consumer runs on box-edge and uses the private
+> `9092` listener. Step 12.1 has the full picture; Step 17.4 decommissions it if
+> you have already built it.
 
 This is the username and password ClickHouse Cloud will authenticate with. Create
 it **after** the broker is running, over the local plaintext listener — which needs
@@ -833,7 +869,13 @@ can never be **lowered**. And 3 partitions would not be high availability either
 they would all live on this one broker.
 </details>
 
-### 10.8 Prove the public listener works — do not skip this
+### 10.8 Prove the public listener works
+
+> **LEGACY — skip this on a fresh build.** It proves the PUBLIC `9094` listener,
+> whose only client was ClickHouse Cloud's Kafka engine. What matters now is that
+> **box-edge** can reach `9092` over the private IP, which Step 11's `✓ Check`
+> (a 202, not a 502) and Step 13.1's `batch` lines both prove. Step 17.4
+> decommissions the public path.
 
 This is the single most likely thing to be broken, and diagnosing it later through
 ClickHouse's error messages is miserable.
@@ -942,15 +984,28 @@ KAFKA_USE_IAM=false
 
 BODY_BYTES=65536
 
-# Dispatcher only. The edge ignores all of this.
+# ── the two workers. The edge ignores every line below. ──────────────────────
+# The CONSUMER writes to ClickHouse; the DISPATCHER reads from it. Both are on
+# this box, and both are configured from this one file.
 CLICKHOUSE_URL=https://<your-service>.clickhouse.cloud:8443
 CLICKHOUSE_DATABASE=signals
 CLICKHOUSE_USER=default
 CLICKHOUSE_PASSWORD=<from Step 2>
 
 PAYMENTS_URL=https://your-payments-app.vercel.app
+# Used by BOTH workers now: /api/internal/resolve (consumer) and
+# /api/internal/settle (dispatcher). Each exits 2 without it.
 INTERNAL_SETTLE_SECRET=<must match the payments deployment>
 
+# --- the consumer (a systemd SERVICE, always on) -----------------------------
+CONSUME_GROUP_ID=signal-resolver
+CONSUME_CONCURRENCY=16
+CONSUME_FROM_BEGINNING=false
+RESOLVE_TIMEOUT_MS=10000
+RESOLVE_POISON_AFTER=5
+RESOLVE_OUTAGE_MS=120000
+
+# --- the dispatcher (one-shot, on timers) ------------------------------------
 DISPATCH_WINDOW_MS=180000
 DISPATCH_MAX_ROWS=100000
 DISPATCH_TIMEOUT_MS=310000
@@ -958,6 +1013,11 @@ DISPATCH_GZIP=true
 DISPATCH_SINCE=
 DISPATCH_UNTIL=
 ```
+
+> **`CONSUME_GROUP_ID` is not a label.** Changing it creates a brand-new Kafka
+> consumer group with no committed offsets, which then starts wherever
+> `CONSUME_FROM_BEGINNING` says — and re-resolving the topic costs one HTTP call
+> per signal, against a serverless function. Set it once.
 
 ```bash
 chmod 600 /srv/events-microservice/.env
@@ -1014,82 +1074,318 @@ as its source, or `INTERNAL` in `advertised.listeners` isn't the private IP.
 
 ---
 
-## Step 12 — ClickHouse schema
+### 11.4 Already built box-edge before the consumer existed?
 
-In the ClickHouse Cloud **SQL console** (left sidebar of your service).
+If you completed Step 11 on the old code — edge running, 202 confirmed — this is
+the whole delta. **The edge itself does not change**: same routes, same envelope,
+same 202. What changes is that `dist/` now has to contain a second worker, and
+`.env` a few more keys.
 
-**Order matters: create `signal_log` first.** The materialized view starts draining
-the moment it exists, so its destination table must already be there.
+```bash
+cd /srv/events-microservice
+sudo systemctl stop edge
 
-1. Open `docker/clickhouse/init/01-schema.sql` from this repo.
-2. Run the `CREATE DATABASE` and the `signals.signal_log` block **unchanged**.
-3. Then run `kafka_signals` with the `SETTINGS` block **replaced** — the committed
-   one points at `kafka:29092`, a Docker address that does not exist in AWS:
+git pull                    # or: git fetch && git checkout <the branch>
+npm ci
+npm run build
 
-```sql
-CREATE TABLE IF NOT EXISTS signals.kafka_signals
-(
-  raw String
-)
-ENGINE = Kafka
-SETTINGS
-  kafka_broker_list       = 'kafka.yourdomain.com:9094',
-  kafka_topic_list        = 'signals',
-  kafka_group_name        = 'clickhouse-signal-log',
-  kafka_format            = 'JSONAsString',
-  kafka_num_consumers     = 1,
-  kafka_security_protocol = 'sasl_ssl',
-  kafka_sasl_mechanism    = 'SCRAM-SHA-512',
-  kafka_sasl_username     = 'clickhouse',
-  kafka_sasl_password     = '<KAFKA SCRAM PASSWORD>',
-  kafka_auto_offset_reset = 'earliest';
+# The consumer's entry point only exists after a rebuild — check before going on.
+ls dist/workers/consume/consume.runner.js
 ```
 
-4. Then run the `signal_log_mv` block **unchanged**.
-5. Then run `docker/clickhouse/migrations/002_ingested_at_index.sql` and
-   `003_kafka_auto_offset_reset.sql`.
+Then **append** the consumer block to `/srv/events-microservice/.env`. Nothing
+already in the file changes:
 
-**Leave `kafka_num_consumers = 1`.** With one partition, one consumer is the most
-that can do any work.
+```bash
+sudo tee -a /srv/events-microservice/.env >/dev/null <<'EOF'
 
-> **Never run `SELECT` against `kafka_signals`.** ClickHouse will refuse with
-> *Code 620 · Direct select is not allowed*, and that refusal is protecting you:
-> reading the stream **consumes messages and commits offsets**, so every row you'd
-> see is a row the materialized view never receives — permanently gone from the
-> archive. **Never set `stream_like_engine_allow_direct_select`.** Query
-> `signal_log` instead; it is a normal table with no side effects.
-
-> **These settings cannot be edited later.** `ALTER TABLE … MODIFY SETTING` does
-> not work on a `Kafka` engine table. To change the broker or password: drop
-> `signal_log_mv` **first** (it holds the consumer), then `kafka_signals`, then
-> recreate both. `signal_log` is untouched, and the group name is unchanged so
-> offsets resume.
-
-**✓ Check:**
-
-```sql
-SELECT count() FROM signals.signal_log;      -- includes Step 11's test signal
-
-SELECT table, num_messages_read, last_poll_time, last_commit_time,
-       exceptions.time, exceptions.text
-FROM system.kafka_consumers;
+# --- the consumer (added with the Kafka -> ClickHouse rewrite) ---
+CONSUME_GROUP_ID=signal-resolver
+CONSUME_CONCURRENCY=16
+CONSUME_FROM_BEGINNING=false
+RESOLVE_TIMEOUT_MS=10000
+RESOLVE_POISON_AFTER=5
+RESOLVE_OUTAGE_MS=120000
+EOF
 ```
 
-You want `num_messages_read` above zero and `exceptions.text` empty. If you see a
-live consumer with **0 messages** and a repeating connection error, go back to
-Step 10.3 — `advertised.listeners`.
+`PAYMENTS_URL` and `INTERNAL_SETTLE_SECRET` are already there from Step 11.3 — the
+consumer reads the same two, because `/api/internal/resolve` sits behind the same
+shared secret as `/api/internal/settle`.
+
+```bash
+sudo systemctl start edge
+curl -s localhost:3000/health | jq
+```
+
+**✓ Check:** the edge is back on 202. Do **not** install the consumer unit yet —
+its target table does not have the verdict columns until Step 12, and it needs
+`/api/internal/resolve` deployed on the payments side. Step 13 starts it, in that
+order.
+
+> **Your `sg-edge` needs no change.** The consumer makes exactly two outbound
+> connections — the broker on box-kafka's private `9092`, and HTTPS to the payments
+> app — and security groups allow all outbound by default. Nothing new listens on
+> box-edge, so there is no new inbound rule either.
 
 ---
 
-## Step 13 — Dispatch timers
+## Step 12 — ClickHouse schema
 
-On **box-edge**. The dispatcher is a one-shot program, not a daemon: each run reads
-one time window of the archive, posts it to the payments app, and exits.
+**ONE table.** ClickHouse does not consume Kafka any more: `kafka_signals` and
+`signal_log_mv` are gone, and `src/workers/consume/` on box-edge drains the topic
+instead. It resolves every signal against the payments app before archiving it —
+work a materialized view could never do, because it cannot make an HTTP request.
+
+`signal_log` gains five columns holding that verdict, plus a `version` column:
+
+| Column | What |
+| --- | --- |
+| `customer_id` | a lifted **copy** of the payload's `customerId`, so the archive is queryable. The payload keeps its own, byte-for-byte |
+| `organization_id` | **ours**, resolved from the API key digest. `''` when the key never resolved |
+| `status` | `PROCESSING` (settle prices it) · `PENDING` (rejected — settle records the failure, prices nothing) · `SUCCESS` (written later by the daily reconciliation cron) |
+| `error_code` | machine-readable, low cardinality, so *"how many `API_KEY_REJECTED` this hour"* is a cheap `GROUP BY` |
+| `error_message` | the human sentence payments gave |
+| `version` | an **engine argument**, so a row can be rewritten later. Nothing uses it yet |
+
+> **Why `version` is here before anything needs it.** It makes the engine
+> `ReplacingMergeTree(version)` instead of plain `ReplacingMergeTree`, which is
+> what lets a row be updated — re-inserted higher, newest wins. The daily
+> reconciliation cron will do that. A table's ENGINE **cannot be `ALTER`ed**, so
+> adding the argument later means building a second table, copying every row, and
+> exchanging them. Adding it now costs one `UInt32`.
+
+### 12.0 Deploy the payments changes FIRST
+
+The consumer calls `POST /api/internal/resolve` for every signal. Until that route
+is deployed and answering, the consumer exits **2** on startup and nothing reaches
+the archive at all. It needs three things beyond what the route does today:
+
+- **`customerId` checked** against the resolved organisation, in the same call.
+- **`403` for a bad customer key, `401` reserved for our shared secret.** Today
+  both are `401`. This is the one that matters most: a `401` read as a customer
+  problem archives *every signal on the topic* as a caller error, silently, until
+  somebody notices.
+- **`5xx` for its own failures** (a database hiccup), so the consumer retries
+  instead of rejecting a signal from a perfectly good key.
+
+Do not start Step 13 before this is live.
+
+---
+
+### 12.1 A fresh ClickHouse service
+
+In the ClickHouse Cloud **SQL console** (left sidebar of your service).
+
+Open `docker/clickhouse/init/01-schema.sql` from this repo and run it unchanged.
+It is one `CREATE DATABASE` and one `CREATE TABLE`. There is nothing to
+substitute — no broker address, no SASL block, no credentials, because ClickHouse
+never talks to Kafka.
+
+Then skip to the **✓ Check** at the end of this step.
+
+> **Steps 9, 10.2, 10.6 and 10.8 were for the old path.** The `kafka.` DNS record,
+> the Let's Encrypt certificate, the `clickhouse` SCRAM user and the public `9094`
+> listener existed so ClickHouse Cloud could reach into your VPC. Nothing outside
+> the VPC connects to the broker now. On a fresh build you can skip all four, drop
+> the `EXTERNAL` listener from `server.properties` in 10.3, and leave `sg-kafka`
+> with no rule but `9092` from `sg-edge` and `22` from your own IP.
+
+---
+
+### 12.2 You already created `kafka_signals` and `signal_log_mv`
+
+This is the cutover. Follow it in order — **step 3 is the one that loses signals
+if you skip it.**
+
+**1 · Stop the old ingestion.** In the SQL console:
+
+```sql
+DROP VIEW IF EXISTS signals.signal_log_mv;
+```
+
+The view *is* the Kafka consumer, so dropping it stops ingestion immediately.
+Nothing is lost: the broker keeps everything for `log.retention.hours=168`.
+
+**2 · Read the old group's final committed offset.** On **box-kafka**:
 
 ```bash
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group clickhouse-signal-log
+```
+
+Note `CURRENT-OFFSET` for partition 0. Call it `<N>`.
+
+**3 · Seed the new group to that offset.** Still on box-kafka:
+
+```bash
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group signal-resolver --topic signals \
+  --reset-offsets --to-offset <N> --execute
+```
+
+> **THIS IS THE STEP THAT LOSES SIGNALS IF SKIPPED.** `signal-resolver` is a brand
+> new group with no committed offsets, so without this it starts wherever
+> `auto.offset.reset` decides — and **both answers are wrong**:
+>
+> - **earliest** re-reads the entire topic and re-resolves every historical signal,
+>   one HTTP call each, against a serverless function.
+> - **latest** silently skips everything produced between the `DROP VIEW` above and
+>   the consumer's first poll.
+>
+> Seeding is the only correct answer.
+
+**✓ Check** the seed landed before going on:
+
+```bash
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group signal-resolver
+```
+
+`CURRENT-OFFSET` must equal `<N>`, and `LAG` must equal whatever has arrived since.
+
+**4 · Migrate the table.** Back in the SQL console, run
+`docker/clickhouse/migrations/004_resolver_columns.sql`.
+
+It is a **rebuild, not an `ALTER`** — a new table, a copy, an `EXCHANGE TABLES`,
+and a drop. The five columns could have been added in place; the engine argument
+is what forces the rebuild. Your existing rows come across marked `PROCESSING`
+with an empty `organization_id`, which is safe rather than a guess: the dispatcher
+still forwards `apiKeyHash`, and settle falls back to resolving from it.
+
+> The copy preserves `ingested_at` rather than re-defaulting it. Taking `now64(3)`
+> would drop every historical row into the dispatcher's next 3-minute window at
+> once.
+
+**5 · Drop the Kafka table.** Run
+`docker/clickhouse/migrations/005_drop_kafka_engine.sql`.
+
+After this nothing in ClickHouse talks to a broker.
+
+---
+
+### ✓ Check — either path
+
+```sql
+-- the one table, with the verdict columns and the right engine
+SELECT name, type FROM system.columns
+ WHERE database = 'signals' AND table = 'signal_log' ORDER BY position;
+
+SELECT engine_full FROM system.tables
+ WHERE database = 'signals' AND name = 'signal_log';
+```
+
+`engine_full` must read **`ReplacingMergeTree(version)`** — with the argument. Plain
+`ReplacingMergeTree` means you ran the old schema, and fixing it later is a full
+table rebuild.
+
+```sql
+-- both must be EMPTY: two writers on signal_log would race
+SELECT name FROM system.tables
+ WHERE database = 'signals' AND name IN ('kafka_signals', 'signal_log_mv');
+
+-- and no Kafka consumer left inside ClickHouse
+SELECT * FROM system.kafka_consumers;
+```
+
+Your existing rows survive:
+
+```sql
+SELECT status, count() FROM signals.signal_log GROUP BY status;
+```
+
+> **The archive stops being reproducible by replaying the topic**, and that is worth
+> knowing rather than discovering. A row now carries a verdict that came from an
+> HTTP call, and a replay re-runs those calls — a key that has since expired answers
+> differently. `signal_log` still has exactly **one writer**; it is the consumer now,
+> not a materialized view.
+
+---
+
+## Step 13 — The consumer service and the dispatch timers
+
+Both run on **box-edge**, and both come out of `deploy/systemd/`. They are not the
+same kind of thing, and the difference is the point:
+
+| Unit | Kind | Why |
+| --- | --- | --- |
+| `signal-consumer.service` | **always on** | a Kafka consumer group member that started and exited every 60s would spend its life rebalancing the group instead of draining it |
+| `dispatch.timer` + `dispatch-reconcile.timer` | **one-shot, on a timer** | each run reads one window of the archive, posts it, and exits. It holds no connection worth keeping |
+
+All three units run as a `dispatch` service account, not as `ubuntu`. Create it
+first, or every one of them fails to start:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin dispatch 2>/dev/null || true
+
 sudo cp /srv/events-microservice/deploy/systemd/*.service \
         /srv/events-microservice/deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
+```
+
+> **Leave the tree owned by `ubuntu` and leave `.env` at `600`.** Do not `chown -R`
+> it to `dispatch`: deploys (`git pull && npm run build`) run as `ubuntu` and would
+> stop being able to write `dist/`.
+>
+> The units still work, because **systemd reads `EnvironmentFile=` itself, as root,
+> while preparing the service — before it drops to `User=dispatch`.** The service
+> account never needs to read `.env` at all. It only needs to *read* `dist/`, which
+> the default `755`/`644` permissions already allow.
+
+### 13.1 The consumer
+
+Start this **first** — the dispatcher has nothing to read until the consumer has
+written something.
+
+```bash
+sudo systemctl enable --now signal-consumer
+sudo systemctl status signal-consumer
+journalctl -u signal-consumer -f -o cat
+```
+
+**✓ Check:** a `consumer.started` line, then a `batch` line for each poll that had
+messages:
+
+```json
+{"event":"batch","partition":0,"read":12,"processing":11,"pending":1,
+ "quarantined":0,"stoppedAt":-1,"committed":12}
+```
+
+Read it like this:
+
+| Field | Means |
+| --- | --- |
+| `processing` | resolved and acceptable — settle will price these |
+| `pending` | rejected by payments (bad key, bad body, unknown customer). **Not an error in the consumer** — the signal is archived with its reason and still goes to settle |
+| `quarantined` | a signal payments could not answer about, five times running, **while other calls were succeeding**. Non-zero is worth an alarm |
+| `stoppedAt` | `-1` is a clean batch. Anything else is the index it stopped at; everything before it was written and committed, the rest is redelivered |
+| `committed` | how many offsets moved. Always ≤ `read` |
+
+**If it exits 2**, the unit stops and stays stopped rather than restarting — that
+is deliberate, because every restart would fail identically. `systemctl status`
+names the reason. It is one of three: no `INTERNAL_SETTLE_SECRET`, no
+`KAFKA_BROKERS`, or payments refusing our shared secret on `/api/internal/resolve`.
+
+**If it exits 1**, systemd restarts it after 5s. That is the transient path —
+payments unreachable, ClickHouse down, broker gone. Nothing is committed, so the
+signals stay on the topic.
+
+**✓ Check the archive is actually filling:**
+
+```sql
+SELECT status, count(), max(ingested_at)
+  FROM signals.signal_log
+ WHERE ingested_at > now() - INTERVAL 5 MINUTE
+ GROUP BY status;
+```
+
+`PROCESSING` rows with a **non-empty `organization_id`** are the proof the whole
+resolve path works. If every row is `PENDING` with `error_code = 'RESOLVE_FAILED'`,
+payments is not answering — check `PAYMENTS_URL` and the shared secret.
+
+### 13.2 The dispatch timers
+
+```bash
 sudo systemctl enable --now dispatch.timer dispatch-reconcile.timer
 sudo systemctl list-timers 'dispatch*'
 journalctl -u dispatch -f -o cat
@@ -1098,10 +1394,17 @@ journalctl -u dispatch -f -o cat
 **✓ Check:** `list-timers` shows both timers with a *NEXT* time, and the journal
 shows a run within a minute.
 
-Exit codes are the interface: **0** sent or nothing to send, **1** transient (the
-next tick is the retry — there is no backoff), **2** misconfigured (every tick will
-fail identically until a human fixes it). Details:
+Exit codes are the interface for both workers: **0** clean, **1** transient (for the
+dispatcher the next tick is the retry; for the consumer systemd restarts it), **2**
+misconfigured — every attempt will fail identically until a human acts. Details:
 [deploy/systemd/README.md](../deploy/systemd/README.md).
+
+> **Consumer downtime turns into dispatcher row loss, and it is not obvious.**
+> While the consumer is off, Kafka holds everything safely. But when it catches up,
+> every one of those signals gets `ingested_at = now` — so they all land in a
+> *single* dispatcher window and can blow past `DISPATCH_MAX_ROWS`, which is an
+> out-of-memory guard, not a batch size. Hitting it means rows were left unsent and
+> the next window has already moved past them. Alarm on `run.capped` (Step 17.3).
 
 ---
 
@@ -1258,15 +1561,36 @@ curl -s -X POST $BASE/api/v1/signal \
   -d '{"customerId":"cus_real","inputTokens":1200,"outputTokens":340}' | jq
 ```
 
-Then walk the five hops. Each has its own place to look:
+Then walk the six hops. Each has its own place to look:
 
 | Hop | Where to check |
 | --- | --- |
 | 1. CloudFront → ALB → edge | the response above: **202** with a `signalId` |
 | 2. edge → Kafka | box-edge: `journalctl -u edge -f` |
-| 3. Kafka → ClickHouse | SQL console: `SELECT * FROM signals.signal_log WHERE signal_id = '<id>'` |
-| 4. dispatcher → settle | box-edge: `journalctl -u dispatch -f -o cat` |
-| 5. settle → Postgres | the payments app's `SignalLog` / `SignalStatus` rows |
+| 3. Kafka → consumer → resolve | box-edge: `journalctl -u signal-consumer -f -o cat` — a `batch` line whose `processing` count went up |
+| 4. consumer → ClickHouse | SQL console: `SELECT status, organization_id, error_code FROM signals.signal_log WHERE signal_id = '<id>'` |
+| 5. dispatcher → settle | box-edge: `journalctl -u dispatch -f -o cat` |
+| 6. settle → Postgres | the payments app's `SignalLog` / `SignalStatus` rows |
+
+Hop 4 is the one that proves the redesign: the row must carry
+**`status = 'PROCESSING'` and a non-empty `organization_id`**. A row is no longer
+just a copy of what arrived — it carries the verdict the consumer resolved before
+archiving it.
+
+Now prove the rejection path reaches the archive too. Send a signal with a
+customer that does not exist:
+
+```bash
+curl -s -X POST $BASE/api/v1/signal \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <a real cnk_ key>' \
+  -d '{"customerId":"cus_does_not_exist","inputTokens":1,"outputTokens":1}' | jq
+```
+
+The edge still answers **202** — the gate only checks shape, and rejecting here
+would lose the signal. A minute later that row is in ClickHouse as
+`status = 'PENDING'`, `error_code = 'CUSTOMER_NOT_FOUND'`, with the organisation
+still attributed. That is the design working, not failing.
 
 Now test the rejections. **These are contract, not accidents** — a caller may rely
 on them:
@@ -1289,11 +1613,13 @@ curl -s -X POST $BASE/api/v1/signal \
 Every rejection must **still carry `signalId` and `receivedAt`** — they are stamped
 before anything can fail, so a caller can quote even a hard 404 back at you.
 
-> **Expect hops 4 and 5 to fail for now.** The dispatcher's current design needs two
-> changes on the payments side: settle must accept one call of arbitrary size (its
-> 500-signal cap removed, its per-signal loop replaced by a bulk insert), and it
-> must decompress a gzipped request body. Until both land, that failure is upstream
-> — not your AWS wiring. Hops 1–3 are the real test of this deployment.
+> **Expect hops 5 and 6 to fail until the payments side catches up.** Settle must
+> accept one call of arbitrary size (its 500-signal cap removed, its per-signal loop
+> replaced by a bulk insert), decompress a gzipped request body, and now also
+> **trust the verdict** — using the `organizationId` the consumer resolved instead of
+> re-deriving it, and recording a `PENDING` signal's failure without pricing it.
+> Until those land, the failure is upstream, not your AWS wiring. Hops 1–4 are the
+> real test of this deployment, and hop 3 is the new one.
 
 ---
 
@@ -1320,9 +1646,11 @@ On **`sg-kafka`**, verify:
 
 - **no** port 80 rule (removed in 10.8)
 - **no** `0.0.0.0/0` anywhere
-- port 9094 lists only ClickHouse's egress IPs
 - port 9092's source is `sg-edge`
 - port 22's source is your IP only
+- port 9094 — **should no longer exist at all.** It allowed ClickHouse Cloud's
+  egress IPs into your VPC so its Kafka engine could pull the topic. Nothing
+  outside the VPC consumes from the broker any more. See 17.4.
 
 ### 17.3 Alarms worth having on day one
 
@@ -1331,12 +1659,84 @@ On **`sg-kafka`**, verify:
 | `run.capped` in the dispatch logs | **DATA WAS LOST.** `DISPATCH_MAX_ROWS` is an out-of-memory guard, not a batch size — hitting it means the window held more than one run can carry, and the next window has already moved past some rows |
 | `dispatch.body_near_limit` | approaching Vercel's 4.5 MB request cap; crossing it is a hard 413 for the whole window at once |
 | dispatch failures, ≥3 in a row | the 3× window overlap covers one or two failed runs; three is a real outage, which is what the hourly reconciliation timer exists for |
-| `system.kafka_consumers` exceptions non-empty | ingestion has stopped and the archive is falling behind silently |
+| `signal-consumer` not running, or restarting in a loop | **ingestion has stopped.** Kafka retains the signals, so nothing is lost yet — but see `run.capped` above, because the catch-up lands in one window |
+| `quarantined` > 0 in a `batch` line | a signal payments could not answer about five times running while other calls succeeded. It is archived `PENDING`/`RESOLVE_FAILED` and stepped over so the topic keeps moving — but something is wrong with that signal or that route |
+| consumer exit code **2** | the unit has STOPPED and will not restart: a bad shared secret, or no `KAFKA_BROKERS`. Nothing is draining the topic until a human acts |
+| a rising share of `PENDING` in `signal_log` | callers are being rejected — a revoked key, or an integration sending a `customerId` that does not exist. `GROUP BY error_code, organization_id` names who |
+| consumer **lag** on `signal-resolver` | `kafka-consumer-groups.sh --describe --group signal-resolver`. One HTTP call per signal is this design's throughput ceiling; sustained lag means raising `CONSUME_CONCURRENCY` or adding partitions |
 | EC2 **CPU credit balance**, both servers | `t4g.small` is burstable — exhausting credits throttles you to a fraction of normal speed |
 | ALB 5xx count and target health | the edge is down or unreachable |
 
 For an outage longer than the reconciliation window, replay a specific period with
 `DISPATCH_SINCE` / `DISPATCH_UNTIL`. No code change and no cursor to rewind.
+
+### 17.4 Decommission the broker's public listener
+
+**Optional, and only once Step 13 has been running cleanly for a day or two.**
+Nothing breaks if you leave it — this closes an attack surface that no longer has
+a user.
+
+The public `9094` listener, its Let's Encrypt certificate, the `kafka.` DNS record
+and the `clickhouse` SCRAM user existed for exactly one client: ClickHouse Cloud's
+Kafka engine, reaching into your VPC from the public internet. The consumer runs
+on box-edge and reaches the broker over the private `9092` listener, so that whole
+path is now dead weight.
+
+Confirm nothing is still connecting before you remove anything. On **box-kafka**:
+
+```bash
+# Should list only signal-resolver (and, briefly, the old clickhouse-signal-log).
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
+```
+
+Then, in order:
+
+**1 · Close the firewall first.** EC2 → Security Groups → **`sg-kafka`** → delete
+the port **9094** rule listing ClickHouse's egress IPs. This alone removes the
+exposure; everything below is tidying.
+
+**✓ Check:** the edge still returns 202 and `journalctl -u signal-consumer` still
+shows `batch` lines. Both use `9092`, so neither should notice.
+
+**2 · Drop the `EXTERNAL` listener.** On box-kafka, in
+`/opt/kafka/config/server.properties`, remove `EXTERNAL` from the three listener
+lines so they read:
+
+```properties
+listeners=INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+listener.security.protocol.map=INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+advertised.listeners=INTERNAL://<BOX-KAFKA-PRIVATE-IP>:9092
+```
+
+and delete the four `sasl.*` and `ssl.*` lines. Then `sudo systemctl restart
+kafka`.
+
+> `advertised.listeners` is still the line that breaks this deployment. `INTERNAL`
+> must remain box-kafka's **private IP**, never `localhost` — box-edge would
+> otherwise be told to connect to itself.
+
+**3 · Retire the certificate and the DNS record.** `sudo certbot delete --cert-name
+kafka.yourdomain.com`, remove the certbot renewal hook, and delete the `kafka` A
+record at GoDaddy. Keep the Elastic IP — box-kafka still uses it for outbound.
+
+**4 · Delete the SCRAM user.** It authenticated nobody now:
+
+```bash
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --entity-type users --entity-name clickhouse --delete-config 'SCRAM-SHA-512'
+```
+
+**5 · Delete the stale consumer group**, once you are certain the cutover took:
+
+```bash
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --delete --group clickhouse-signal-log
+```
+
+> Do **not** do step 5 before you have verified `signal-resolver`'s offsets in Step
+> 12.2. That group's committed offsets are the only record of where the old
+> ingestion stopped, and if the seed was wrong they are what you would seed from
+> again.
 
 ---
 
@@ -1352,7 +1752,12 @@ For an outage longer than the reconciliation window, replay a specific period wi
 | certbot fails | DNS not resolving yet, or port 80 not open on `sg-kafka` |
 | Kafka won't start | typo in `server.properties` — read the **first** exception |
 | Edge returns 502 `QUEUE_UNAVAILABLE` | `sg-kafka`:9092 source isn't `sg-edge`, or `INTERNAL` advertised address is wrong |
-| ClickHouse consumer alive, 0 messages | `advertised.listeners` **`EXTERNAL`**, or the 9094 egress-IP rules |
+| `signal-consumer` exits 2 immediately | no `INTERNAL_SETTLE_SECRET` or no `KAFKA_BROKERS` in `.env`, or payments refusing our shared secret on `/api/internal/resolve`. The unit stays stopped on purpose |
+| Every row lands `PENDING` / `RESOLVE_FAILED` | payments is not answering the consumer — check `PAYMENTS_URL` and that `/api/internal/resolve` is deployed |
+| Every row lands `PENDING` / `API_KEY_REJECTED` | resolve is answering `403` for keys that should work — or it is still answering `401` for both cases and 12.0's split was never made |
+| Rows land `PROCESSING` but `organization_id` is empty | rows from before the cutover (migration 004 marks them so). Harmless — settle falls back to `apiKeyHash` |
+| Consumer runs, archive stays empty | the topic has nothing new, or the group was seeded past it. `kafka-consumer-groups.sh --describe --group signal-resolver` and read `LAG` |
+| Consumer lag climbs and never drains | one HTTP call per signal is the ceiling. Raise `CONSUME_CONCURRENCY`, or add partitions (`kafka_auto_offset_reset` concerns are gone with the Kafka engine) |
 | Target group stuck **unhealthy** | `sg-edge`:3000 source must be `sg-alb`, not an IP |
 | Everything 401 through CloudFront | origin request policy isn't **AllViewer** |
 
@@ -1367,7 +1772,7 @@ For an outage longer than the reconciliation window, replay a specific period wi
  3  GoDaddy DNS panel; Name field is RELATIVE; TTL 600
  4  VPC console -> default VPC id; two subnet ids (A = both boxes, B = ALB only)
  5  sg-alb (443 open) · sg-edge (3000 from sg-alb, 22 me) · sg-kafka (9092 from
-    sg-edge, 9094 from ~6 CH ips, 22 me, 80 temporarily)
+    sg-edge, 22 me, 80 temporarily; the 9094 CH-egress rule is LEGACY — 12.1)
  6  allocate 1 Elastic IP
  7  launch box-kafka: Ubuntu 24.04 ARM, t4g.small, SUBNET A, sg-kafka, 30 GiB
     -> associate EIP -> record PRIVATE IP -> ssh works
@@ -1379,14 +1784,23 @@ For an outage longer than the reconciliation window, replay a specific period wi
     -> kcat proves 9094 -> close port 80 and your 9094 rule
 11  box-edge: node -> clone + build -> .env (KAFKA_BROKERS = private ip)
     -> edge.service -> curl localhost:3000 returns 202
-12  ClickHouse SQL: signal_log FIRST -> kafka_signals (your domain, sasl_ssl)
-    -> signal_log_mv -> migrations 002 + 003 -> count() rises
-13  box-edge: dispatch.timer + dispatch-reconcile.timer
+12  PAYMENTS FIRST: /api/internal/resolve takes customerId, 403 != 401, 5xx on
+    its own faults.  Fresh CH: run init/01-schema.sql, ONE table, nothing to
+    substitute.  Already ran the old step 12: DROP VIEW signal_log_mv -> read
+    clickhouse-signal-log's CURRENT-OFFSET -> SEED signal-resolver to it (skip
+    this and you lose or re-resolve everything) -> migration 004 -> 005.
+    engine_full must say ReplacingMergeTree(VERSION)
+13  box-edge: signal-consumer.service FIRST (always on) -> batch lines show
+    processing/pending -> then dispatch.timer + dispatch-reconcile.timer
 14  ACM cert (your region) + GoDaddy CNAME -> target group :3000 /health
     -> ALB HTTPS 443 across two AZs -> curl -k the ALB
 15  cert for CloudFront (must be us-east-1; reuse step 14's if REGION=us-east-1)
     -> CloudFront: CachingDisabled + AllViewer
     -> GoDaddy CNAME api -> dxxxx.cloudfront.net
-16  verify five hops + three rejection modes
+16  verify six hops + three rejection modes + one PENDING round trip
 17  sg-alb 443 -> CloudFront prefix list; confirm sg-kafka tight; set alarms
+    (run.capped, consumer down, quarantined>0, consumer lag)
+17.4 optional: the broker's public 9094 path had ONE user, ClickHouse Cloud.
+    Drop the sg-kafka 9094 rule, the EXTERNAL listener, the cert, the kafka A
+    record and the clickhouse SCRAM user
 ```

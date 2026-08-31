@@ -70,12 +70,11 @@ export function toIso(clickhouseTimestamp: string): string {
  * Turns an archive row into the signal settle wants.
  *
  * The payload is spread FIRST and the envelope written over it, so a caller who
- * happened to send `"signalId"`, `"attempt"`, `"receivedAt"` or `"apiKeyHash"` in
- * their own body cannot impersonate the edge's stamp. `organizationId` is
- * stripped outright — see the note at the `delete`. Returns null when the payload
- * will not parse, which for a row the edge accepted should be impossible — but a
- * row that cannot be turned into a signal must be skipped loudly, not sent
- * half-built.
+ * happened to send `"signalId"`, `"attempt"`, `"receivedAt"`, `"apiKeyHash"`,
+ * `"organizationId"` or `"status"` in their own body cannot impersonate what the
+ * pipeline stamped. Returns null when the payload will not parse, which for a row
+ * the edge accepted should be impossible — but a row that cannot be turned into a
+ * signal must be skipped loudly, not sent half-built.
  */
 export function toSettleSignal(row: SignalLogRow, attempt = 1): SettleSignal | null {
   let payload: Record<string, unknown>
@@ -86,17 +85,31 @@ export function toSettleSignal(row: SignalLogRow, attempt = 1): SettleSignal | n
   } catch {
     return null
   }
-  // The caller's `organizationId` is REMOVED, not overwritten. The archive is a
-  // verbatim copy of a request body, so this field is caller-controlled; settle
-  // resolves the real organisation from `apiKeyHash`, and forwarding a
-  // body-supplied one would let a caller name a tenant they do not own. Deleting
-  // it means settle sees no claim at all rather than one it has to distrust.
-  delete payload.organizationId
   return {
     ...payload,
     signalId: row.signal_id,
     receivedAt: toIso(row.received_at),
     apiKeyHash: row.api_key_hash,
+    // WRITTEN now, not deleted — and the reversal is deliberate, so do not
+    // "restore" the old `delete payload.organizationId` (BUG-1 in
+    // docs/FINDINGS.md).
+    //
+    // The archive is a verbatim copy of a request body, so a payload-supplied
+    // `organizationId` is caller-controlled and once let a caller bill another
+    // tenant. That defence is UNCHANGED: the caller's value is still discarded,
+    // because the spread above is overwritten by this line. What changed is that
+    // there is now a TRUSTED value to overwrite it with — the consumer resolved
+    // it against /api/internal/resolve before the row was ever archived. Deleting
+    // it today would throw away the attribution settle depends on and force settle
+    // to re-resolve every signal, which is the work the consumer exists to remove.
+    organizationId: row.organization_id,
+    // An INSTRUCTION to settle, not a description: PROCESSING means price it,
+    // PENDING means record the failure below and price nothing.
+    status: row.status,
+    // Empty string is the ClickHouse column's "absent" — the columns are not
+    // Nullable — and null is what settle's schema wants.
+    errorCode: row.error_code === '' ? null : row.error_code,
+    errorMessage: row.error_message === '' ? null : row.error_message,
     // Always 1: this process keeps no state, so it cannot know which delivery
     // this is. `SignalStatus` counts attempts, on the side that can see them.
     attempt,
@@ -140,7 +153,7 @@ export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
 
   const empty: RunOutcome = {
     read: rows.length, sent: 0, skipped: 0,
-    processed: 0, userError: 0, serverError: 0,
+    processed: 0, pending: 0, userError: 0, serverError: 0,
     capped, bytes: 0, gzipBytes: 0, ms: now() - startedAt, batchId,
   }
   if (rows.length === 0) return empty
@@ -160,6 +173,12 @@ export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
 
   const { results, bytes, gzipBytes } = await payments.settle(batchId, signals)
 
+  // Counted from what the ARCHIVE said, not from what settle answered: a signal
+  // the consumer already rejected was never priced, so counting it as a settle
+  // outcome would read as though settle had refused it.
+  let pending = 0
+  for (const signal of signals) if (signal.status === 'PENDING') pending += 1
+
   let processed = 0
   let userError = 0
   let serverError = 0
@@ -174,6 +193,7 @@ export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
     sent: signals.length,
     skipped,
     processed,
+    pending,
     userError,
     serverError,
     capped,

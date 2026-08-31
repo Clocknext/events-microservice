@@ -8,11 +8,18 @@ import type {
   SignalLogRow,
 } from './dispatch.schema.js'
 
+/** An accepted row by default: the consumer resolved the key, so `status` is
+ *  PROCESSING and `organization_id` is set. Override for a PENDING row. */
 function row(over: Partial<SignalLogRow> = {}): SignalLogRow {
   return {
     signal_id: '01M0X91S3X2SK86WYYWVENM3N7',
     received_at: '2026-08-26 10:00:00.000',
     api_key_hash: 'a'.repeat(64),
+    customer_id: 'cus_1',
+    organization_id: 'org_1',
+    status: 'PROCESSING',
+    error_code: '',
+    error_message: '',
     payload: '{"customerId":"cus_1","inputTokens":10,"outputTokens":5}',
     ...over,
   }
@@ -101,15 +108,47 @@ test('attempt is always 1 — this side no longer counts deliveries', () => {
   assert.equal(toSettleSignal(row({ payload: '{"attempt":7}' }))?.attempt, 1)
 })
 
-test('a caller-supplied organizationId is stripped, not merely overwritten (BUG-1)', () => {
+test('a caller-supplied organizationId is overwritten by the resolved one (BUG-1)', () => {
   // The payload is a verbatim copy of a request body, so this field is
-  // caller-controlled: forwarding it let a caller bill another tenant. Settle
-  // must see NO claim, not one it has to distrust.
+  // caller-controlled: forwarding it let a caller bill another tenant. The
+  // defence is unchanged — the caller's value never survives. What changed is
+  // that the consumer now resolves a TRUSTED one against /api/internal/resolve,
+  // so the field is written rather than deleted. Deleting it today would throw
+  // away the attribution and force settle to re-resolve every signal.
   const signal = toSettleSignal(
-    row({ payload: '{"customerId":"cus_1","organizationId":"org_someone_else"}' }),
+    row({
+      organization_id: 'org_theirs',
+      payload: '{"customerId":"cus_1","organizationId":"org_someone_else"}',
+    }),
   )
   assert.ok(signal)
-  assert.equal('organizationId' in signal, false)
+  assert.equal(signal.organizationId, 'org_theirs')
+})
+
+test('a row the consumer rejected travels as PENDING, with its reason', () => {
+  const signal = toSettleSignal(
+    row({
+      organization_id: 'org_1',
+      status: 'PENDING',
+      error_code: 'CUSTOMER_NOT_FOUND',
+      error_message: 'Customer "cus_nope" not found.',
+    }),
+  )
+  assert.ok(signal)
+  assert.equal(signal.status, 'PENDING')
+  assert.equal(signal.errorCode, 'CUSTOMER_NOT_FOUND')
+  assert.equal(signal.errorMessage, 'Customer "cus_nope" not found.')
+})
+
+test('an accepted row carries no error — empty columns become null, not ""', () => {
+  // The ClickHouse columns are not Nullable, so absence is the empty string
+  // there and null on the wire. Sending "" would read as an error with no
+  // message.
+  const signal = toSettleSignal(row())
+  assert.ok(signal)
+  assert.equal(signal.status, 'PROCESSING')
+  assert.equal(signal.errorCode, null)
+  assert.equal(signal.errorMessage, null)
 })
 
 test('an unparseable or non-object payload is skipped, not sent half-built', () => {

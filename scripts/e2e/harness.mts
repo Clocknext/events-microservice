@@ -155,17 +155,28 @@ export class Db {
 
 // ── the archive ──────────────────────────────────────────────────────────────
 
+/** Deliberately the same shape as the dispatcher's `SignalLogRow` — the trace
+ *  scripts hand these rows straight to `toSettleSignal`, so a column added there
+ *  has to be selected here or the run fails at the type level rather than at
+ *  three in the morning. */
 export interface ArchiveRow {
   signal_id: string
   received_at: string
   api_key_hash: string
+  customer_id: string
+  organization_id: string
+  status: string
+  error_code: string
+  error_message: string
   payload: string
 }
 
 export async function archiveRow(signalId: string): Promise<ArchiveRow | null> {
   const rows = await clickhouse.query<ArchiveRow>(
-    `SELECT signal_id, received_at, api_key_hash, payload
-       FROM signal_log WHERE signal_id = {id:String} LIMIT 1`,
+    `SELECT signal_id, received_at, api_key_hash, customer_id,
+            organization_id, status, error_code, error_message, payload
+       FROM signal_log WHERE signal_id = {id:String}
+      ORDER BY version DESC LIMIT 1`,
     { id: signalId },
   )
   return rows[0] ?? null

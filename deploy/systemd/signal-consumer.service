@@ -1,0 +1,59 @@
+# The consumer: Kafka -> /api/internal/resolve -> ClickHouse.
+#
+# A SERVICE, not a timer, and the only unit here that is. The dispatcher is a
+# one-shot because it holds no connection worth keeping; a Kafka consumer group
+# member that started and exited every 60 seconds would spend its life
+# rebalancing the group instead of draining it.
+#
+# It replaced ClickHouse's own Kafka ingestion (an `ENGINE = Kafka` table and a
+# materialized view) because a materialized view cannot make an HTTP request, and
+# every signal now needs one before it is archived.
+[Unit]
+Description=Signal consumer — Kafka to ClickHouse, resolving every signal
+Documentation=file:///srv/events-microservice/docs/IMPLEMENTATION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dispatch
+Group=dispatch
+WorkingDirectory=/srv/events-microservice
+
+# LOAD-BEARING, exactly as for the dispatcher. `.env` is read by the npm scripts,
+# never by the code — src/config.ts only reads process.env. Invoke node directly
+# without this and the process gets no configuration at all and exits 2.
+EnvironmentFile=/srv/events-microservice/.env
+
+# `dist`, not tsx.
+ExecStart=/usr/bin/node dist/workers/consume/consume.runner.js
+
+# SIGTERM is handled: the process disconnects from the group so the broker
+# rebalances immediately instead of waiting out the 30s session timeout. Give it
+# room to finish the batch it is holding — abandoning one mid-flight is safe
+# (nothing is committed until the insert lands) but costs a redelivery.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+Restart=on-failure
+RestartSec=5
+
+# EXIT CODE 2 IS A MISCONFIGURATION — no INTERNAL_SETTLE_SECRET, no
+# KAFKA_BROKERS, or payments refusing our shared secret. Every restart would fail
+# identically, so the unit STOPS and stays stopped rather than hiding a
+# configuration error behind a restart loop. `systemctl status signal-consumer`
+# then shows the reason instead of a counter.
+RestartPreventExitStatus=2
+
+# One JSON line per batch, to journald. `journalctl -u signal-consumer -f` is the
+# log; `event="batch"` lines carry the PROCESSING/PENDING split.
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
