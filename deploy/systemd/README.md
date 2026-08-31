@@ -32,19 +32,28 @@ without it.
 
 ## Install
 
+All three units expect the checkout at **`/home/ubuntu/events-microservice`** and
+run as **`ubuntu`** — the user that owns the tree and runs the deploy. There is no
+service account to create and nothing to `chown`:
+
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin dispatch
-sudo chown -R dispatch:dispatch /srv/events-microservice
+cd /home/ubuntu/events-microservice
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now signal-consumer
 sudo systemctl enable --now dispatch.timer dispatch-reconcile.timer
 ```
 
-`.env` must be readable by the `dispatch` user (both workers run as that user) and
-must contain `INTERNAL_SETTLE_SECRET` — each exits 2 without it rather than 401 in
-a loop. The consumer additionally needs `KAFKA_BROKERS`. `EnvironmentFile=` in the
-units is not optional: `.env` is loaded by the npm scripts, never by the code.
+Living under `/home` costs exactly one line of hardening: the units set
+**`ProtectHome=read-only`, not `true`** — `true` mounts /home as an empty tmpfs
+inside the unit's namespace, and node would fail to open `dist/`. Nothing in
+either worker writes to disk, so read-only gives up nothing that mattered.
+
+`.env` sits beside `dist/` at `/home/ubuntu/events-microservice/.env`, mode `600`,
+owned by `ubuntu`, and must contain `INTERNAL_SETTLE_SECRET` — each worker exits 2
+without it rather than 401 in a loop. The consumer additionally needs
+`KAFKA_BROKERS`. `EnvironmentFile=` in the units is not optional: `.env` is loaded
+by the npm scripts, never by the code.
 
 ## Exit codes, and what systemd does with them
 
@@ -121,7 +130,8 @@ For an outage longer than the reconciliation window, replay an explicit window b
 hand. No code change and no cursor to rewind, because there is no cursor:
 
 ```bash
-sudo -u dispatch env $(grep -v '^#' /srv/events-microservice/.env | xargs) \
+cd /home/ubuntu/events-microservice
+env $(grep -v '^#' .env | xargs) \
   DISPATCH_SINCE=2026-08-26T04:00:00Z \
   DISPATCH_UNTIL=2026-08-26T05:00:00Z \
   DISPATCH_MAX_ROWS=1000000 \

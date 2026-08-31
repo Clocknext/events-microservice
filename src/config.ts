@@ -129,14 +129,23 @@ export const config = {
   /** In-flight resolve calls per batch. THE throughput ceiling of this design:
    *  every signal costs one HTTP round trip to a serverless function. Raising it
    *  buys throughput until payments starts refusing connections. */
+  /** RETIRED, read only so an old `.env` does not silently change behaviour.
+   *  There is no concurrency pool any more — resolve takes a batch. */
   consumeConcurrency: intFromEnv('CONSUME_CONCURRENCY', 16),
+  /** Most signals in ONE resolve call. A Kafka poll larger than this is split.
+   *
+   *  Sized under the route's own 5,000 cap. kafkajs's default
+   *  `maxBytesPerPartition` is 1MB and a signal envelope is roughly 250 bytes, so
+   *  a full poll is ~4,000 messages — one or two calls, not four thousand. */
+  resolveBatchMax: intFromEnv('RESOLVE_BATCH_MAX', 2_000),
   /** Start a new group at the OLDEST offset instead of resuming. True only for a
    *  deliberate full replay — it re-resolves every signal the topic still holds. */
   consumeFromBeginning: (process.env.CONSUME_FROM_BEGINNING ?? '').toLowerCase() === 'true',
-  /** Timeout on ONE resolve call. Short on purpose: a slow call blocks a slot in
-   *  the concurrency pool, and a timeout is retryable — the message stays on the
+  /** Timeout on ONE resolve call, which now covers a WHOLE BATCH rather than one
+   *  signal — hence 30s, not the 10s that was right when a call meant one row.
+   *  A timeout is retryable either way: the messages stay on the
    *  topic. */
-  resolveTimeoutMs: intFromEnv('RESOLVE_TIMEOUT_MS', 10_000),
+  resolveTimeoutMs: intFromEnv('RESOLVE_TIMEOUT_MS', 30_000),
   /** Consecutive transient failures on ONE signal, WHILE OTHER CALLS SUCCEED,
    *  before it is archived as PENDING/`RESOLVE_FAILED` and stepped over.
    *

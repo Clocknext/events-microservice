@@ -17,10 +17,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=dispatch
-Group=dispatch
-WorkingDirectory=/srv/events-microservice
-EnvironmentFile=/srv/events-microservice/.env
+# `ubuntu`, not a `dispatch` service account — see dispatch.service.
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/events-microservice
+EnvironmentFile=/home/ubuntu/events-microservice/.env
 
 # Environment= is applied AFTER EnvironmentFile=, so this wins over whatever
 # .env says. Two hours of ingestion, and a cap raised to match — the default
@@ -37,4 +38,7 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+
+# read-only, not true — the tree is under /home now, and `true` would hide it
+# from the unit. See dispatch.service for the whole reason.
+ProtectHome=read-only

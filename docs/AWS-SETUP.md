@@ -27,7 +27,7 @@ CloudFront ──▶ ALB ──▶ box-edge   t4g.small
                             │
                             │ the CONSUMER pulls it, from inside the VPC
                             ▼
-              payments /api/internal/resolve   ← one call per signal:
+              payments /api/internal/resolve   ← ONE call per batch:
                             │                    whose key is this, and is
                             │  the verdict       this body acceptable?
                             ▼
@@ -956,17 +956,22 @@ node --version
 
 ### 11.2 Clone and build
 
+The checkout lives in **ubuntu's home** — `/home/ubuntu/events-microservice`. You
+are already logged in as `ubuntu`, so there is no `sudo`, no directory to create
+and no ownership to fix: the user that deploys the code already owns every file it
+writes. Every unit in this repo is pointed here.
+
 ```bash
-sudo mkdir -p /srv && sudo chown ubuntu:ubuntu /srv
-git clone <your-repo-url> /srv/events-microservice
-cd /srv/events-microservice && npm ci && npm run build
+cd ~
+git clone <your-repo-url> events-microservice
+cd ~/events-microservice && npm ci && npm run build
 ```
 
 **✓ Check:** `ls dist/server.js` exists.
 
 ### 11.3 Configuration
 
-Create `/srv/events-microservice/.env`:
+Create `/home/ubuntu/events-microservice/.env`:
 
 ```bash
 NODE_ENV=production
@@ -999,11 +1004,16 @@ INTERNAL_SETTLE_SECRET=<must match the payments deployment>
 
 # --- the consumer (a systemd SERVICE, always on) -----------------------------
 CONSUME_GROUP_ID=signal-resolver
-CONSUME_CONCURRENCY=16
 CONSUME_FROM_BEGINNING=false
-RESOLVE_TIMEOUT_MS=10000
+# Signals per resolve call. ONE call carries the whole batch — this is a request
+# SIZE, not a concurrency ceiling. Keep it under the route's own 5000 cap.
+RESOLVE_BATCH_MAX=2000
+# Covers a WHOLE BATCH, not one signal. 10000 was right when a call meant one row.
+RESOLVE_TIMEOUT_MS=30000
 RESOLVE_POISON_AFTER=5
 RESOLVE_OUTAGE_MS=120000
+# CONSUME_CONCURRENCY is RETIRED. Harmless if left behind — it is read and
+# ignored — but there is no concurrency pool any more.
 
 # --- the dispatcher (one-shot, on timers) ------------------------------------
 DISPATCH_WINDOW_MS=180000
@@ -1020,7 +1030,7 @@ DISPATCH_UNTIL=
 > per signal, against a serverless function. Set it once.
 
 ```bash
-chmod 600 /srv/events-microservice/.env
+chmod 600 /home/ubuntu/events-microservice/.env
 ```
 
 > **`.env` is read by the npm scripts, never by the code** — `src/config.ts` only
@@ -1037,8 +1047,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/srv/events-microservice
-EnvironmentFile=/srv/events-microservice/.env
+WorkingDirectory=/home/ubuntu/events-microservice
+EnvironmentFile=/home/ubuntu/events-microservice/.env
 ExecStart=/usr/bin/node dist/server.js
 Restart=always
 RestartSec=5
@@ -1082,7 +1092,7 @@ same 202. What changes is that `dist/` now has to contain a second worker, and
 `.env` a few more keys.
 
 ```bash
-cd /srv/events-microservice
+cd ~/events-microservice
 sudo systemctl stop edge
 
 git pull                    # or: git fetch && git checkout <the branch>
@@ -1093,19 +1103,24 @@ npm run build
 ls dist/workers/consume/consume.runner.js
 ```
 
-Then **append** the consumer block to `/srv/events-microservice/.env`. Nothing
+Then **append** the consumer block to `/home/ubuntu/events-microservice/.env`. Nothing
 already in the file changes:
 
 ```bash
-sudo tee -a /srv/events-microservice/.env >/dev/null <<'EOF'
+tee -a ~/events-microservice/.env >/dev/null <<'EOF'
 
 # --- the consumer (added with the Kafka -> ClickHouse rewrite) ---
 CONSUME_GROUP_ID=signal-resolver
-CONSUME_CONCURRENCY=16
 CONSUME_FROM_BEGINNING=false
-RESOLVE_TIMEOUT_MS=10000
+# Signals per resolve call. ONE call carries the whole batch — this is a request
+# SIZE, not a concurrency ceiling. Keep it under the route's own 5000 cap.
+RESOLVE_BATCH_MAX=2000
+# Covers a WHOLE BATCH, not one signal. 10000 was right when a call meant one row.
+RESOLVE_TIMEOUT_MS=30000
 RESOLVE_POISON_AFTER=5
 RESOLVE_OUTAGE_MS=120000
+# CONSUME_CONCURRENCY is RETIRED. Harmless if left behind — it is read and
+# ignored — but there is no concurrency pool any more.
 EOF
 ```
 
@@ -1155,21 +1170,63 @@ work a materialized view could never do, because it cannot make an HTTP request.
 > adding the argument later means building a second table, copying every row, and
 > exchanging them. Adding it now costs one `UInt32`.
 
-### 12.0 Deploy the payments changes FIRST
+### 12.0 The payments side must be REACHABLE first
 
-The consumer calls `POST /api/internal/resolve` for every signal. Until that route
-is deployed and answering, the consumer exits **2** on startup and nothing reaches
-the archive at all. It needs three things beyond what the route does today:
+The consumer calls `POST /api/internal/resolve` and cannot archive anything until
+that route answers. Without it the consumer exits **2** on startup, the unit stops,
+and nothing reaches the archive at all.
+
+**The route's requirements are now IMPLEMENTED** in the payments repo (branch
+`microservices/events`) and verified against real data — `npm run verify:resolve`
+there is the gate. What they were, for the record, because each one is a silent
+failure if it regresses:
 
 - **`customerId` checked** against the resolved organisation, in the same call.
-- **`403` for a bad customer key, `401` reserved for our shared secret.** Today
-  both are `401`. This is the one that matters most: a `401` read as a customer
-  problem archives *every signal on the topic* as a caller error, silently, until
-  somebody notices.
+- **`403` for a bad customer key, `401` reserved for OUR shared secret.** Both used
+  to be `401`. This was the dangerous one: the consumer reads a `401` as a refused
+  shared secret, throws `MisconfiguredError` and exits 2 — so one customer sending
+  an expired key stopped ingestion for everyone. It is now unreachable by shape,
+  not merely by correct code: per-signal rejections are FIELDS on a batch item, so
+  nothing about a customer can wear a status that also means something about us.
 - **`5xx` for its own failures** (a database hiccup), so the consumer retries
   instead of rejecting a signal from a perfectly good key.
+- **A BATCH shape** — `{ signals: [ { signalId, apiKeyHash, body }, … ] }`, one
+  call for a whole Kafka poll. It was one call per signal, which is a named Kafka
+  anti-pattern: measured against real data it capped near 90 signals/sec at two
+  Postgres queries each. Batched, 500 signals cost one call and two queries.
+  `apiKeyHash` moved out of the `X-Api-Key-Hash` header and into each item, and had
+  to — a Kafka batch spans customers, so one header cannot describe it.
 
-Do not start Step 13 before this is live.
+**The single-signal shape still works**, deliberately, for one release. That is what
+makes the order below safe: payments can be updated first and the events checkout
+second, in either state, without a window where the two disagree.
+
+> **NOT IN PRODUCTION YET?** Very likely, and it does not block you. `PAYMENTS_URL`
+> is a plain config string — nothing validates the scheme or the host — so it can
+> point at any address box-edge can reach:
+>
+> - **A Vercel preview deployment** of `microservices/events`. The durable choice
+>   and the same serverless shape as prod. Turn **Deployment Protection off for
+>   previews** — its auth wall answers `401`, which the consumer reads as a refused
+>   shared secret and exits 2 on. And check the preview's `DATABASE_URL` first:
+>   `npm run build` there is `prisma migrate deploy && next build`, so a preview
+>   deploy runs migrations against whatever that variable names.
+> - **A tunnel to a local machine** — `cloudflared tunnel --url http://localhost:3001`
+>   prints an HTTPS hostname that becomes `PAYMENTS_URL`. It dials OUT, so no port
+>   forward, no inbound address, and CGNAT is irrelevant. A quick tunnel takes a
+>   NEW random hostname every start, and box-edge will not know: the consumer exits
+>   1 and restarts forever with nothing saying why. Use a named tunnel for anything
+>   longer than one sitting.
+> - **A port forward to a public IP**, if you have a genuinely inbound-reachable
+>   one. Restrict it to box-edge's Elastic IP: the shared secret rides in a plaintext
+>   header over `http://`, and it protects tenant ATTRIBUTION now, not just access —
+>   a leak lets a caller name any organisation.
+>
+> Whichever you pick, run `npm run start` (or `next start`) rather than `next dev`.
+> A cold dev-mode route compile can outlast `RESOLVE_TIMEOUT_MS` and make a healthy
+> route look like an outage.
+
+Do not start Step 13 before the route answers.
 
 ---
 
@@ -1229,7 +1286,8 @@ Note `CURRENT-OFFSET` for partition 0. Call it `<N>`.
 > `auto.offset.reset` decides — and **both answers are wrong**:
 >
 > - **earliest** re-reads the entire topic and re-resolves every historical signal,
->   one HTTP call each, against a serverless function.
+>   re-resolving the whole history. Cheaper than it was — a batch is one call, not
+>   one per signal — but it is still every historical signal re-priced.
 > - **latest** silently skips everything produced between the `DROP VIEW` above and
 >   the consumer's first poll.
 >
@@ -1312,25 +1370,30 @@ same kind of thing, and the difference is the point:
 | `signal-consumer.service` | **always on** | a Kafka consumer group member that started and exited every 60s would spend its life rebalancing the group instead of draining it |
 | `dispatch.timer` + `dispatch-reconcile.timer` | **one-shot, on a timer** | each run reads one window of the archive, posts it, and exits. It holds no connection worth keeping |
 
-All three units run as a `dispatch` service account, not as `ubuntu`. Create it
-first, or every one of them fails to start:
+All three units run as **`ubuntu`**, out of the checkout in ubuntu's home — the
+same user `edge.service` already runs as. There is no service account to create and
+nothing to `chown`:
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin dispatch 2>/dev/null || true
-
-sudo cp /srv/events-microservice/deploy/systemd/*.service \
-        /srv/events-microservice/deploy/systemd/*.timer /etc/systemd/system/
+sudo install -m 0644 ~/events-microservice/deploy/systemd/*.service \
+                     ~/events-microservice/deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
-> **Leave the tree owned by `ubuntu` and leave `.env` at `600`.** Do not `chown -R`
-> it to `dispatch`: deploys (`git pull && npm run build`) run as `ubuntu` and would
-> stop being able to write `dist/`.
+> **Why not a separate `dispatch` service account?** Because the tree is a git
+> checkout in `/home/ubuntu`, which is mode `0750`. A service account could not
+> even traverse it without `chmod 0755` on someone's home directory, and it would
+> then fight the deploy — `git pull && npm run build` runs as `ubuntu` and has to
+> keep writing `dist/`. Running the workers as the user that owns the tree is the
+> honest version of that arrangement. **Leave the tree owned by `ubuntu` and leave
+> `.env` at `600`.**
 >
-> The units still work, because **systemd reads `EnvironmentFile=` itself, as root,
-> while preparing the service — before it drops to `User=dispatch`.** The service
-> account never needs to read `.env` at all. It only needs to *read* `dist/`, which
-> the default `755`/`644` permissions already allow.
+> Living under `/home` changed exactly one line in each unit:
+> **`ProtectHome=read-only`, not `true`.** `true` mounts /home as an empty tmpfs
+> inside the unit's own namespace, so node would start and immediately fail to open
+> `dist/`. Neither worker writes a byte to disk, so read-only gives up nothing.
+> `.env` is unaffected either way — systemd reads `EnvironmentFile=` itself, as
+> root, before the namespace exists and before it drops to `User=`.
 
 ### 13.1 The consumer
 
@@ -1357,14 +1420,22 @@ Read it like this:
 | --- | --- |
 | `processing` | resolved and acceptable — settle will price these |
 | `pending` | rejected by payments (bad key, bad body, unknown customer). **Not an error in the consumer** — the signal is archived with its reason and still goes to settle |
-| `quarantined` | a signal payments could not answer about, five times running, **while other calls were succeeding**. Non-zero is worth an alarm |
+| `quarantined` | a signal payments could not answer about, `RESOLVE_POISON_AFTER` times running, **in batches the route actually answered**. Non-zero is worth an alarm |
 | `stoppedAt` | `-1` is a clean batch. Anything else is the index it stopped at; everything before it was written and committed, the rest is redelivered |
 | `committed` | how many offsets moved. Always ≤ `read` |
 
 **If it exits 2**, the unit stops and stays stopped rather than restarting — that
 is deliberate, because every restart would fail identically. `systemctl status`
-names the reason. It is one of three: no `INTERNAL_SETTLE_SECRET`, no
-`KAFKA_BROKERS`, or payments refusing our shared secret on `/api/internal/resolve`.
+names the reason. It is one of four: no `INTERNAL_SETTLE_SECRET`, no
+`KAFKA_BROKERS`, payments refusing our shared secret (a `401`), or payments refusing
+our batch ENVELOPE (a `400` — `RESOLVE_BATCH_MAX` above the route's cap, or the two
+sides disagreeing on the request shape).
+
+> Note what is NOT in that list any more: a bad CUSTOMER key. It used to be, by
+> accident — resolve answered `401` for an unknown or expired customer key exactly
+> as it did for a refused shared secret, so the first customer to send a stale key
+> stopped ingestion for every tenant. Per-signal rejections are now fields on a
+> batch item and cannot carry a status at all.
 
 **If it exits 1**, systemd restarts it after 5s. That is the transient path —
 payments unreachable, ClickHouse down, broker gone. Nothing is committed, so the
@@ -1382,6 +1453,41 @@ SELECT status, count(), max(ingested_at)
 `PROCESSING` rows with a **non-empty `organization_id`** are the proof the whole
 resolve path works. If every row is `PENDING` with `error_code = 'RESOLVE_FAILED'`,
 payments is not answering — check `PAYMENTS_URL` and the shared secret.
+
+Add `error_code` to the `GROUP BY` when something looks wrong; it is low-cardinality
+for exactly this, and it names the failure precisely:
+
+| `error_code` | Means |
+| --- | --- |
+| `''` on a `PROCESSING` row | resolved cleanly. What you want |
+| `API_KEY_REJECTED` / `API_KEY_EXPIRED` | the customer's key. Check it exists in the database this deployment is pointed at |
+| `CUSTOMER_NOT_FOUND` | the `customerId` is not in that key's organisation — or does not exist. Deliberately the same answer for both, so a stolen key cannot probe other tenants |
+| `CUSTOMER_ARCHIVED` | exists and is theirs, but may not be billed |
+| `VALIDATION_FAILED` | the body broke the rulebook. `error_message` names the field |
+| `RESOLVE_FAILED` | **ours** — the route could not answer about this signal five times running. Alarm on it |
+
+### 13.1a Picking up the batched resolve
+
+If box-edge was built before the batch shape landed, it is still sending one call
+per signal. Nothing is broken — the route accepts both, which is the whole point of
+that overlap — but it is running at a fraction of the throughput and it still
+carries the fragile poison-detection logic the batch shape removed.
+
+```bash
+cd ~/events-microservice
+git pull
+npm ci --omit=dev && npm run build
+# the consumer block gained RESOLVE_BATCH_MAX and RESOLVE_TIMEOUT_MS went to 30s
+sudo systemctl restart signal-consumer
+journalctl -u signal-consumer -f -o cat
+```
+
+**Update the payments side FIRST.** It accepts both shapes, so payments-then-events
+works in every intermediate state; events-first means a new consumer talking to an
+old route, which answers `400` and stops the unit on exit 2.
+
+**✓ Check** the same `batch` lines, and lag draining faster than before. A batch of
+500 is now one HTTP call rather than 500.
 
 ### 13.2 The dispatch timers
 
@@ -1663,7 +1769,7 @@ On **`sg-kafka`**, verify:
 | `quarantined` > 0 in a `batch` line | a signal payments could not answer about five times running while other calls succeeded. It is archived `PENDING`/`RESOLVE_FAILED` and stepped over so the topic keeps moving — but something is wrong with that signal or that route |
 | consumer exit code **2** | the unit has STOPPED and will not restart: a bad shared secret, or no `KAFKA_BROKERS`. Nothing is draining the topic until a human acts |
 | a rising share of `PENDING` in `signal_log` | callers are being rejected — a revoked key, or an integration sending a `customerId` that does not exist. `GROUP BY error_code, organization_id` names who |
-| consumer **lag** on `signal-resolver` | `kafka-consumer-groups.sh --describe --group signal-resolver`. One HTTP call per signal is this design's throughput ceiling; sustained lag means raising `CONSUME_CONCURRENCY` or adding partitions |
+| consumer **lag** on `signal-resolver` | `kafka-consumer-groups.sh --describe --group signal-resolver`. Resolve is no longer the ceiling — one call carries a whole poll, measured in the thousands of signals/sec — so sustained lag now points at the ClickHouse insert, the payments database, or a partition count too low for the volume |
 | EC2 **CPU credit balance**, both servers | `t4g.small` is burstable — exhausting credits throttles you to a fraction of normal speed |
 | ALB 5xx count and target health | the edge is down or unreachable |
 
@@ -1754,10 +1860,12 @@ record at GoDaddy. Keep the Elastic IP — box-kafka still uses it for outbound.
 | Edge returns 502 `QUEUE_UNAVAILABLE` | `sg-kafka`:9092 source isn't `sg-edge`, or `INTERNAL` advertised address is wrong |
 | `signal-consumer` exits 2 immediately | no `INTERNAL_SETTLE_SECRET` or no `KAFKA_BROKERS` in `.env`, or payments refusing our shared secret on `/api/internal/resolve`. The unit stays stopped on purpose |
 | Every row lands `PENDING` / `RESOLVE_FAILED` | payments is not answering the consumer — check `PAYMENTS_URL` and that `/api/internal/resolve` is deployed |
-| Every row lands `PENDING` / `API_KEY_REJECTED` | resolve is answering `403` for keys that should work — or it is still answering `401` for both cases and 12.0's split was never made |
+| Every row lands `PENDING` / `API_KEY_REJECTED` | resolve is answering `403` for keys that should work. Check the key really is in the deployment's database — a preview or tunnel pointed at a different `DATABASE_URL` than the one you minted the key in looks exactly like this |
+| Unit **stops** with exit 2, "refused our shared secret" | `INTERNAL_SETTLE_SECRET` differs between box-edge's `.env` and the payments deployment. On a Vercel PREVIEW also check Deployment Protection — its auth wall answers `401`, indistinguishable from a wrong secret from here |
+| Unit **stops** with exit 2, "refused our batch envelope" | a `400` from resolve: `RESOLVE_BATCH_MAX` is above the route's cap, or the two sides disagree on the request shape. Our bug, never the signals' — it must not be read as "the whole batch was invalid" |
 | Rows land `PROCESSING` but `organization_id` is empty | rows from before the cutover (migration 004 marks them so). Harmless — settle falls back to `apiKeyHash` |
 | Consumer runs, archive stays empty | the topic has nothing new, or the group was seeded past it. `kafka-consumer-groups.sh --describe --group signal-resolver` and read `LAG` |
-| Consumer lag climbs and never drains | one HTTP call per signal is the ceiling. Raise `CONSUME_CONCURRENCY`, or add partitions (`kafka_auto_offset_reset` concerns are gone with the Kafka engine) |
+| Consumer lag climbs and never drains | no longer the resolve call. Look at the ClickHouse insert and the payments database first; add partitions only on a measured symptom. `RESOLVE_BATCH_MAX` raises the size of one call, which is the lever that used to be `CONSUME_CONCURRENCY` |
 | Target group stuck **unhealthy** | `sg-edge`:3000 source must be `sg-alb`, not an IP |
 | Everything 401 through CloudFront | origin request policy isn't **AllViewer** |
 
@@ -1784,7 +1892,8 @@ record at GoDaddy. Keep the Elastic IP — box-kafka still uses it for outbound.
     -> kcat proves 9094 -> close port 80 and your 9094 rule
 11  box-edge: node -> clone + build -> .env (KAFKA_BROKERS = private ip)
     -> edge.service -> curl localhost:3000 returns 202
-12  PAYMENTS FIRST: /api/internal/resolve takes customerId, 403 != 401, 5xx on
+12  PAYMENTS REACHABLE FIRST (preview / tunnel / forward — PAYMENTS_URL is just
+    a string). Route needs: batch shape, customerId, 403 != 401, 5xx on
     its own faults.  Fresh CH: run init/01-schema.sql, ONE table, nothing to
     substitute.  Already ran the old step 12: DROP VIEW signal_log_mv -> read
     clickhouse-signal-log's CURRENT-OFFSET -> SEED signal-resolver to it (skip

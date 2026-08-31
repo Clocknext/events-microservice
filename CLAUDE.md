@@ -598,6 +598,15 @@ loses rows), `DISPATCH_TIMEOUT_MS` (must exceed settle's `maxDuration`),
   `.env`. `EnvironmentFile=` itself is not optional in either unit: `.env` is read
   by the npm scripts, never by the code, so a direct `node dist/...` invocation
   gets no configuration at all and exits 2 every minute.
+- **All three worker units live at `/home/ubuntu/events-microservice` and run as
+  `ubuntu`** — not `/srv`, and not a `dispatch` service account. The tree is a git
+  checkout in a `0750` home directory that `git pull && npm run build` writes to as
+  `ubuntu`, so a separate account would need `chmod 0755` on someone's home and
+  would still fight the deploy over `dist/`. `edge.service` already ran as `ubuntu`.
+  The one hardening consequence: **`ProtectHome=read-only`, not `true`** — `true`
+  mounts /home as an empty tmpfs inside the unit's namespace and node cannot open
+  `dist/`. `EnvironmentFile=` is unaffected; systemd reads it as root before the
+  namespace exists.
 - **`deploy/systemd/`** holds three units: `signal-consumer.service` (always on)
   plus the two dispatch timers — the 1-minute pipeline run and the hourly
   reconciliation. The dispatcher still has no supervised long-lived process; the

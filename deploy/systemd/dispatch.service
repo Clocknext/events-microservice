@@ -4,7 +4,7 @@
 # Started by dispatch.timer, never enabled directly.
 [Unit]
 Description=Signal dispatch — one window to /api/internal/settle
-Documentation=file:///srv/events-microservice/docs/IMPLEMENTATION.md
+Documentation=file:///home/ubuntu/events-microservice/docs/IMPLEMENTATION.md
 # The run reads ClickHouse over HTTP; without this a boot-time tick can fail
 # once for no better reason than DNS not being up yet.
 After=network-online.target
@@ -12,15 +12,21 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=dispatch
-Group=dispatch
-WorkingDirectory=/srv/events-microservice
+# `ubuntu`, not a separate `dispatch` service account. The tree is a git
+# checkout inside ubuntu's home, deployed by `git pull && npm run build` as
+# ubuntu, and /home/ubuntu is 0750 — a service account could not even traverse
+# it without chmod 0755 on someone's home directory or a supplementary group,
+# and would then fight the deploy over ownership of `dist/`. edge.service on the
+# same box has always run as ubuntu; these three now match it.
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/events-microservice
 
 # LOAD-BEARING. `.env` is read by the npm scripts (--env-file-if-exists), never
 # by the code — src/config.ts only ever reads process.env. Invoke node directly
 # without this and the process gets no configuration at all: no
 # INTERNAL_SETTLE_SECRET, so it exits 2 every minute.
-EnvironmentFile=/srv/events-microservice/.env
+EnvironmentFile=/home/ubuntu/events-microservice/.env
 
 # `dist`, not tsx: tsx type-strips the whole graph on every start, and this
 # starts 1,440 times a day.
@@ -37,4 +43,12 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+
+# read-only, NOT true. `ProtectHome=true` mounts /home as an empty tmpfs inside
+# the unit's own namespace, and the tree now lives at
+# /home/ubuntu/events-microservice — node would start and immediately fail to
+# open `dist/`. read-only keeps every protection that matters here (neither
+# worker writes a byte to disk) and still lets it read `dist/`. `.env` is
+# unaffected either way: systemd reads EnvironmentFile= itself, as root, before
+# the namespace exists.
+ProtectHome=read-only

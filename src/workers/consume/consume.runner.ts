@@ -25,7 +25,7 @@ import { generateAuthToken } from 'aws-msk-iam-sasl-signer-js'
 import { config } from '../../config.js'
 import { createClickHouseWriter } from '../../client/clickhouse.js'
 import { MisconfiguredError } from '../../client/payments-client.js'
-import { resolveSignal } from '../../client/resolve-client.js'
+import { BadBatchError, resolveBatch } from '../../client/resolve-client.js'
 import { createArchiveWriter } from './consume.archive.js'
 import { processBatch } from './consume.service.js'
 import type { ConsumeDeps, ResolveHealth } from './consume.schema.js'
@@ -69,20 +69,17 @@ export function createResolveHealth(now: () => number = Date.now): ResolveHealth
   // succeeds, because "never answered" must never read as "answering fine".
   let lastSuccessAt = now()
   let answered = false
-  // A monotonic COUNT of successes, not a timestamp. `lastSuccessAt` has
-  // millisecond resolution, and batches on a busy topic complete inside one
-  // millisecond — so "has a success landed since the streak began" compared as
-  // timestamps can tie, and a genuine poison message would never be quarantined.
-  // A counter cannot tie.
-  let successes = 0
-  // Per signal: how many times in a row it has failed, and the success count when
-  // that streak STARTED. The second field is what makes `succeededSinceStreak`
-  // exact.
-  const failures = new Map<string, { count: number; successesAtStreakStart: number }>()
+  // Per signal: how many times in a row it has failed transiently. That is ALL
+  // that is needed now.
+  //
+  // It used to carry a second field — the monotonic success count when the streak
+  // began — because poison had to be inferred from "did anything else succeed
+  // since". With one resolve call per batch the verdict says so directly
+  // (`routeAnswered`), so the counter and its tie-breaking subtlety are gone.
+  const failures = new Map<string, number>()
   return {
     recordSuccess(signalId: string): void {
       lastSuccessAt = now()
-      successes += 1
       answered = true
       // Per-signal, NOT a global clear. Poison is defined by failing while other
       // calls succeed, so clearing every counter on any success would erase the
@@ -90,20 +87,9 @@ export function createResolveHealth(now: () => number = Date.now): ResolveHealth
       failures.delete(signalId)
     },
     recordFailure(signalId: string): number {
-      const existing = failures.get(signalId)
-      if (existing) {
-        existing.count += 1
-        return existing.count
-      }
-      failures.set(signalId, { count: 1, successesAtStreakStart: successes })
-      return 1
-    },
-    succeededSinceStreak(signalId: string): boolean {
-      const streak = failures.get(signalId)
-      if (!streak) return false
-      // Strictly MORE successes than when the streak began. A success that
-      // predates it says nothing about whether the route is answering now.
-      return successes > streak.successesAtStreakStart
+      const count = (failures.get(signalId) ?? 0) + 1
+      failures.set(signalId, count)
+      return count
     },
     msSinceSuccess: () => now() - lastSuccessAt,
     hasAnswered: () => answered,
@@ -140,11 +126,11 @@ export function parseSignalMessage(value: Buffer | null): SignalMessage | null {
 
 export function buildDeps(health: ResolveHealth): ConsumeDeps {
   return {
-    resolve: { resolve: resolveSignal },
+    resolve: { resolveBatch },
     archive: createArchiveWriter(createClickHouseWriter()),
     health,
     config: {
-      concurrency: config.consumeConcurrency,
+      batchMax: config.resolveBatchMax,
       poisonAfter: config.resolvePoisonAfter,
     },
     log: line,
@@ -195,7 +181,7 @@ export async function run(): Promise<void> {
     brokers: config.kafkaBrokers,
     topic: config.kafkaTopic,
     groupId: config.consumeGroupId,
-    concurrency: config.consumeConcurrency,
+    batchMax: config.resolveBatchMax,
     iam: config.kafkaUseIam,
   })
 
@@ -260,9 +246,10 @@ export async function run(): Promise<void> {
         rawIndexOf.push(index)
       }
 
-      // `heartbeat` is bound here because a batch of 500 signals is 500 HTTP
-      // calls — long enough that the broker decides we are dead and rebalances
-      // the group mid-batch without it.
+      // `heartbeat` is bound here so `processBatch` can call it between resolve
+      // CHUNKS. It used to be load-bearing — 500 signals meant 500 sequential
+      // HTTP calls, long enough for the broker to declare us dead and rebalance
+      // mid-batch. One call per chunk cannot outlast a session timeout that way.
       const outcome = await processBatch({ ...deps, onProgress: heartbeat }, parsed)
 
       // Everything strictly before the first unresolved message is written and
@@ -324,7 +311,11 @@ export async function run(): Promise<void> {
         await delay(1_000)
       }
       } catch (error) {
-        if (error instanceof MisconfiguredError) fatal = error
+        // Recorded HERE, at the point it is thrown, for both classes — see the
+        // note above `fatal`. `BadBatchError` joins `MisconfiguredError` because
+        // it is the same kind of thing: our request is wrong, every retry fails
+        // identically, and a human has to act.
+        if (error instanceof MisconfiguredError || error instanceof BadBatchError) fatal = error
         throw error
       }
     },
@@ -344,7 +335,8 @@ if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
       process.exit(0)
     })
     .catch((error: unknown) => {
-      const misconfigured = error instanceof MisconfiguredError
+      const misconfigured =
+        error instanceof MisconfiguredError || error instanceof BadBatchError
       line('consumer.failed', {
         error: error instanceof Error ? error.message : String(error),
         exit: misconfigured ? 2 : 1,

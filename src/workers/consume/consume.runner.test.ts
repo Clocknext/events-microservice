@@ -54,42 +54,31 @@ test('a fresh tracker has NOT answered, however recently it was created', () => 
   assert.equal(health.hasAnswered(), true)
 })
 
-test('succeededSinceStreak needs a success AFTER the streak began', () => {
-  // The exact rule the quarantine turns on, and the one an elapsed-time proxy got
-  // wrong against a live broker.
-  let clock = 1_000
-  const health = createResolveHealth(() => clock)
-
-  health.recordSuccess('sig-earlier')
-  clock += 70_000
-  health.recordFailure('sig-x')
-  // Note the comparison is on a monotonic success COUNT, not on these
-  // timestamps: batches complete inside one millisecond, so a timestamp compare
-  // would tie and a real poison message would never be caught.
-  // A success that PREDATES the streak proves nothing about the route now.
-  assert.equal(health.succeededSinceStreak('sig-x'), false)
-
-  clock += 1_000
-  health.recordFailure('sig-x')
-  assert.equal(health.succeededSinceStreak('sig-x'), false)
-
-  // Other traffic gets through, mid-streak. Now it is poison.
-  clock += 1_000
-  health.recordSuccess('sig-other')
-  assert.equal(health.succeededSinceStreak('sig-x'), true)
-})
-
-test('succeededSinceStreak is false for a signal with no streak, and when cold', () => {
+test('the tracker no longer decides liveness — that moved onto the verdict', () => {
+  // `succeededSinceStreak` used to live here: "has some OTHER call succeeded since
+  // this signal's streak began", compared as a monotonic success COUNT because
+  // timestamps tie inside a millisecond. It was the quarantine's liveness gate,
+  // and it was inference — the best available when one resolve call covered one
+  // signal.
+  //
+  // With one call per BATCH the evidence is direct: a per-item transient inside a
+  // 200 means the route answered (`ResolveVerdict.routeAnswered`). So this
+  // interface is down to a failure COUNT plus the runner's outage clock, and the
+  // subtlety went with it. Asserted as a shape so nobody reintroduces the gate
+  // here and quietly re-splits the rule across two places.
   const health = createResolveHealth(() => 1_000)
-  assert.equal(health.succeededSinceStreak('never-seen'), false)
-  health.recordFailure('sig-x')
-  // Cold tracker: nothing has EVER answered, so nothing can license a quarantine.
-  assert.equal(health.succeededSinceStreak('sig-x'), false)
+  assert.equal('succeededSinceStreak' in health, false)
+  assert.deepEqual(Object.keys(health).sort(), [
+    'hasAnswered',
+    'msSinceSuccess',
+    'recordFailure',
+    'recordSuccess',
+  ])
 })
 
 test('a failure streak is per-signal, and only its OWN success clears it', () => {
-  // Poison is defined as failing WHILE OTHERS SUCCEED, so a global clear on any
-  // success would erase the one count the rule depends on.
+  // Still per-signal, and for the same reason: the count identifies ONE signal
+  // that keeps failing, so a global clear on any success would erase it.
   const health = createResolveHealth()
   assert.equal(health.recordFailure('sig-a'), 1)
   assert.equal(health.recordFailure('sig-a'), 2)

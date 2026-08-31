@@ -45,10 +45,13 @@ async function main() {
     remember(signalId)
 
     // ── 2 · the archive ────────────────────────────────────────────────────
-    rule('2 · CLICKHOUSE — the Kafka engine pulls it in by itself')
+    rule('2 · THE CONSUMER — it resolves the signal, THEN archives it')
     const t0 = Date.now()
     const row = await waitFor(() => archiveRow(signalId), { timeoutMs: 30_000 })
-    console.log(`landed after ~${Date.now() - t0}ms (nothing pushed it — ENGINE=Kafka consumes)`)
+    console.log(`landed after ~${Date.now() - t0}ms — one /api/internal/resolve call happened
+inside that gap, and its verdict is the status/organization_id/error_* below.
+ClickHouse pulled nothing: ENGINE=Kafka and its materialized view are GONE,
+because a materialized view cannot make an HTTP request.`)
     show('\nsignal_log ROW', row)
     console.log(`\nreceived_at is UTC but says so nowhere:  ${row!.received_at}`)
     console.log(`toIso() restores the T and the Z:        ${toIso(row!.received_at)}`)
@@ -66,8 +69,9 @@ async function main() {
   THE WINDOW IS OVER ingested_at, NOT received_at, and that is the whole trick.
 
   received_at is the CALLER's time, stamped by N edge instances off N clocks. A
-  row can land here minutes after it — the Kafka engine flushes in batches, and a
-  broker backlog delays it further. Nothing persists a watermark, so a window over
+  row can land here minutes after it — the consumer batches, spends an HTTP round
+  trip per signal, and a broker backlog delays it further. Nothing persists a
+  watermark, so a window over
   received_at would miss such a row permanently. ingested_at is DEFAULT now64(3):
   one clock, one server, "arrived in the archive".
 

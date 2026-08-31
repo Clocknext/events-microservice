@@ -10,20 +10,21 @@
 # every signal now needs one before it is archived.
 [Unit]
 Description=Signal consumer — Kafka to ClickHouse, resolving every signal
-Documentation=file:///srv/events-microservice/docs/IMPLEMENTATION.md
+Documentation=file:///home/ubuntu/events-microservice/docs/IMPLEMENTATION.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=dispatch
-Group=dispatch
-WorkingDirectory=/srv/events-microservice
+# `ubuntu`, not a `dispatch` service account — see dispatch.service.
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/events-microservice
 
 # LOAD-BEARING, exactly as for the dispatcher. `.env` is read by the npm scripts,
 # never by the code — src/config.ts only reads process.env. Invoke node directly
 # without this and the process gets no configuration at all and exits 2.
-EnvironmentFile=/srv/events-microservice/.env
+EnvironmentFile=/home/ubuntu/events-microservice/.env
 
 # `dist`, not tsx.
 ExecStart=/usr/bin/node dist/workers/consume/consume.runner.js
@@ -53,7 +54,10 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+
+# read-only, not true — the tree is under /home now, and `true` would hide it
+# from the unit. See dispatch.service for the whole reason.
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target

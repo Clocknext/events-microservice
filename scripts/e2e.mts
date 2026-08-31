@@ -3,14 +3,21 @@
  *
  *   edge (Fastify) → Kafka → ClickHouse → dispatcher → /api/internal/settle → Postgres
  *
- * Nothing is mocked. Real HTTP into the edge, real Kafka, the real ClickHouse
- * Kafka engine, the real dispatcher run, the real settle route, real Postgres
+ * Nothing is mocked. Real HTTP into the edge, real Kafka, the real consumer
+ * draining it, the real dispatcher run, the real settle route, real Postgres
  * rows — and a real org, plan, credit and model borrowed from the database.
  *
  * PREREQUISITES
  *   docker compose up -d                        kafka + clickhouse
  *   KAFKA_BROKERS=localhost:9092 npm run dev    the edge, on :3000
  *   (payments repo) npx next dev -p 3001        the payments app, on :3001
+ *   npm run consume                             THE CONSUMER — long-lived
+ *
+ * The consumer is a PREREQUISITE, not an optional extra, and it is the one most
+ * easily forgotten: ClickHouse no longer ingests from Kafka itself, so with the
+ * consumer down nothing reaches `signal_log` and every wait on an archive row
+ * times out. A signal sitting on the topic is not a failure — it is a process
+ * that was never started.
  *
  * Then:  npm run e2e
  *

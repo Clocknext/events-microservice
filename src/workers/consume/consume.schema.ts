@@ -69,9 +69,19 @@ export interface SignalLogInsert {
 // The ports
 
 export interface Resolver {
-  /** One call to `/api/internal/resolve`. Returns a verdict rather than throwing,
-   *  except for `MisconfiguredError` — which is about us, not this signal. */
-  resolve(message: SignalMessage): Promise<ResolveVerdict>
+  /** ONE call to `/api/internal/resolve` for the whole chunk, returning one
+   *  verdict per message POSITIONALLY.
+   *
+   *  It was one call per signal until the batch route landed. That is a named
+   *  Kafka anti-pattern — a synchronous external call per message caps throughput
+   *  at (concurrency ÷ latency) and head-of-line blocks the partition behind it.
+   *  Measured against real data it capped near 150 signals/sec at two Postgres
+   *  queries each; a batch of 500 is now one call and two queries.
+   *
+   *  Returns verdicts rather than throwing, except for the two things that are
+   *  not about any signal: `MisconfiguredError` (our shared secret) and
+   *  `BadBatchError` (our envelope). Both exit 2. */
+  resolveBatch(messages: readonly SignalMessage[]): Promise<readonly ResolveVerdict[]>
 }
 
 export interface ArchiveWriter {
@@ -83,14 +93,24 @@ export interface ArchiveWriter {
 
 /** Counters that must outlive a batch but must never outlive the process.
  *
- *  They exist to separate the two failures a single batch cannot tell apart —
- *  and on a low-traffic topic a batch can be ONE message, where "every call
- *  failed" and "one poison message" are literally the same observation:
+ *  WHAT THIS USED TO CARRY, AND WHY IT NO LONGER HAS TO. With one HTTP call per
+ *  signal, "this signal is poison" and "the route is down" were indistinguishable
+ *  from a single failure, so poison had to be INFERRED — a signal counted as
+ *  poison only if some other call had succeeded since its failure streak began,
+ *  compared as a monotonic count because timestamps tie inside a millisecond.
+ *  That inference was subtle enough to get wrong once, in production: a success
+ *  from 70 seconds earlier made a route that was demonstrably down look alive,
+ *  and a good signal was archived as a caller error during a real outage.
  *
- *    one signal keeps failing WHILE OTHERS SUCCEED  → a poison message. Archive
- *      it and move on, or it stalls the whole topic behind it forever.
- *    nothing has succeeded for a long time          → payments is down. Commit
- *      nothing and exit, so systemd backs off instead of hot-looping.
+ *  One call per BATCH makes it direct evidence instead. If the call returned 200
+ *  and one item came back transient, the route answered — see
+ *  `ResolveVerdict.routeAnswered`. So `succeededSinceStreak` is GONE, and what is
+ *  left here is a plain cross-batch failure count plus the runner's outage clock:
+ *
+ *    a signal transient in N successive answered batches → poison. Archive it and
+ *      move on, or it stalls the whole topic behind it forever.
+ *    nothing has succeeded for a long time              → payments is down.
+ *      Commit nothing and exit, so systemd backs off instead of hot-looping.
  *
  *  In memory, not on disk, because they only need to survive a batch. A restart
  *  resetting them is correct: after a restart we genuinely do not know yet. */
@@ -109,33 +129,27 @@ export interface ResolveHealth {
   msSinceSuccess(): number
   /** Has any call succeeded in this process AT ALL? */
   hasAnswered(): boolean
-  /** Has some OTHER call succeeded since THIS signal's current failure streak
-   *  began?
-   *
-   *  This is the quarantine's real question, stated exactly. "Poison" means a
-   *  signal that fails *while others succeed*, and only a success that landed
-   *  AFTER the streak started proves that.
-   *
-   *  An elapsed-time proxy (`msSinceSuccess() < outageMs`) is NOT good enough, and
-   *  the difference is not academic — it was observed. Five consecutive failures
-   *  accumulate in about five seconds; a two-minute outage threshold does not
-   *  expire for another two minutes. So a success from 70 seconds ago made a route
-   *  that was demonstrably DOWN look alive, and a perfectly good signal was
-   *  archived as a caller error during a real outage. A stale success is not
-   *  evidence of a live route. */
-  succeededSinceStreak(signalId: string): boolean
 }
 
 export interface ConsumeConfig {
-  /** In-flight resolve calls. The ceiling on throughput — one HTTP call per
-   *  signal against a serverless function is this design's whole cost. */
-  concurrency: number
-  /** Consecutive transient failures on one signal before it is quarantined —
-   *  necessary, but NOT sufficient. `succeededSinceStreak` is the other half, and
-   *  the count alone would archive good signals during an outage.
+  /** Most signals in ONE resolve call. A Kafka poll can exceed the route's cap,
+   *  so a batch is split into chunks of at most this many; a poll under the limit
+   *  is exactly one call.
    *
-   *  The outage side of the rule is the RUNNER's (`RESOLVE_OUTAGE_MS`), because it
-   *  is about the process, not about a batch. */
+   *  This replaced `concurrency`, and it is not the same kind of knob. Concurrency
+   *  was a throughput CEILING — in-flight HTTP calls against a serverless
+   *  function. This is a request SIZE, and raising it makes the pipeline faster
+   *  rather than merely more parallel. */
+  batchMax: number
+  /** Consecutive transient failures on one signal, IN ANSWERED BATCHES, before it
+   *  is quarantined.
+   *
+   *  The "answered" half used to be inferred (`succeededSinceStreak`); it is now
+   *  read straight off the verdict as `routeAnswered`, because a per-item
+   *  transient inside a 200 is proof the route is alive.
+   *
+   *  The outage side of the rule is still the RUNNER's (`RESOLVE_OUTAGE_MS`),
+   *  because it is about the process, not about a batch. */
   poisonAfter: number
 }
 
@@ -144,9 +158,13 @@ export interface ConsumeDeps {
   archive: ArchiveWriter
   health: ResolveHealth
   config: ConsumeConfig
-  /** Called between resolve calls. The runner binds kafkajs's `heartbeat` here.
-   *  A 500-signal batch is 500 HTTP calls — long enough that the broker decides
-   *  we are dead and rebalances the group mid-batch without it. */
+  /** Called between resolve CHUNKS. The runner binds kafkajs's `heartbeat` here.
+   *
+   *  This used to be load-bearing: 500 signals meant 500 sequential HTTP calls,
+   *  long enough that the broker decided we were dead and rebalanced the group
+   *  mid-batch without it. One call per chunk cannot outlast a session timeout the
+   *  same way, so it is now ordinary defensiveness for the multi-chunk case rather
+   *  than the thing standing between this consumer and a rebalance loop. */
   onProgress?: (() => Promise<void>) | undefined
   log?: ((event: string, detail: Record<string, unknown>) => void) | undefined
   /** Injected so a test can assert on `ms` without a real clock. */

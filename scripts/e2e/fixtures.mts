@@ -14,13 +14,19 @@
  *   edge (Fastify) → Kafka → ClickHouse → dispatcher → /api/internal/settle → Postgres
  *
  * Nothing here is mocked. It drives a real HTTP request into the edge, waits for
- * ClickHouse's Kafka engine to ingest it, runs the real dispatcher, and then
+ * the CONSUMER to resolve and archive it, runs the real dispatcher, and then
  * asserts on the rows the payments app wrote to Postgres.
  *
  * PREREQUISITES — start these first:
  *   docker compose up -d                     kafka + clickhouse
  *   KAFKA_BROKERS=localhost:9092 npm run dev the edge, on :3000
  *   (payments repo) npx next dev -p 3001     the payments app, on :3001
+ *   npm run consume                          the consumer — LONG-LIVED
+ *
+ * The consumer is easy to forget and its absence looks like a broken pipeline:
+ * ClickHouse stopped ingesting from Kafka itself when the resolve call became
+ * part of ingestion, so with it down the signals sit safely on the topic and
+ * every archive wait below simply times out.
  *
  * Then:  npm run e2e
  *

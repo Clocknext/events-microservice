@@ -3,12 +3,12 @@
  *  fakes, exactly as `runOnce` does for the dispatcher.
  *
  *  ─────────────────────────────────────────────────────────────────────────────
- *  ONE BATCH: RESOLVE EVERY SIGNAL, WRITE THE PREFIX, LET THE RUNNER COMMIT
+ *  ONE BATCH: RESOLVE IT IN ONE CALL, WRITE THE PREFIX, LET THE RUNNER COMMIT
  *
  *  The order is load-bearing and it is the one thing here that cannot be
  *  rearranged:
  *
- *    1. resolve every message (bounded concurrency, heartbeating between calls)
+ *    1. resolve every message — ONE call per chunk, not one per message
  *    2. write the resolved PREFIX to ClickHouse in ONE insert
  *    3. the RUNNER commits offsets — only for what step 2 actually wrote
  *
@@ -21,6 +21,21 @@
  *  This function never commits and never touches an offset. It reports what it
  *  wrote and where it stopped, and the runner decides — the same split that lets
  *  `runOnce` be tested without a systemd timer.
+ *
+ *  ─────────────────────────────────────────────────────────────────────────────
+ *  WHAT CHANGED WHEN RESOLVE LEARNED TO TAKE A BATCH
+ *
+ *  Step 1 used to be a bounded-concurrency POOL of one HTTP call per message —
+ *  the throughput ceiling of the whole pipeline, and a named Kafka anti-pattern.
+ *  It is now one call per chunk of `batchMax`.
+ *
+ *  That deleted more than the pool. Poison detection used to be INFERRED: with
+ *  one call per signal, "this message is poison" and "the route is down" look
+ *  identical from a single failure, so a signal counted as poison only if some
+ *  other call had succeeded since its streak began. One call per batch makes it
+ *  direct — a per-item transient inside a 200 is proof the route answered — so the
+ *  rule below reads `verdict.routeAnswered` instead of interrogating a monotonic
+ *  success counter.
  *  ───────────────────────────────────────────────────────────────────────────── */
 import type { SignalMessage } from '../../modules/signal/signal.schema.js'
 import type {
@@ -29,32 +44,6 @@ import type {
   ResolveVerdict,
   SignalLogInsert,
 } from './consume.schema.js'
-
-/** A fixed pool of workers over a shared cursor, rather than `Promise.all` over
- *  everything at once: a batch can hold thousands of messages and each one is an
- *  HTTP call, so unbounded concurrency would open thousands of sockets against a
- *  serverless function and be refused. */
-async function mapWithConcurrency<T>(
-  items: readonly T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  if (items.length === 0) return
-  let cursor = 0
-  const width = Math.max(1, Math.min(limit, items.length))
-  await Promise.all(
-    Array.from({ length: width }, async () => {
-      for (;;) {
-        const index = cursor
-        cursor += 1
-        if (index >= items.length) return
-        const item = items[index]
-        if (item === undefined) return
-        await fn(item, index)
-      }
-    }),
-  )
-}
 
 /**
  * Turns a resolved message into the row that goes in the archive.
@@ -95,14 +84,27 @@ export function toRow(
       }
 }
 
+/** Did this chunk's CALL fail, as opposed to some of its signals?
+ *
+ *  `routeAnswered: false` on every item is exactly that condition — the client
+ *  sets it when the request itself failed (timeout, 5xx, an unusable response).
+ *  Worth detecting because the prefix cannot extend past such a chunk anyway, so
+ *  every later chunk is a request paid for nothing. */
+function callFailed(verdicts: readonly ResolveVerdict[]): boolean {
+  return (
+    verdicts.length > 0 &&
+    verdicts.every((verdict) => verdict.kind === 'transient' && !verdict.routeAnswered)
+  )
+}
+
 /**
  * Resolves and archives one batch.
  *
- * Throws only what the ports throw — `MisconfiguredError` from the resolver (our
- * shared secret is wrong, which is not about any one signal) and whatever
- * ClickHouse throws on a failed insert. Both must propagate: the runner turns
- * them into an exit code, and swallowing either would commit offsets for rows
- * that never landed.
+ * Throws only what the ports throw — `MisconfiguredError` and `BadBatchError` from
+ * the resolver (our shared secret and our envelope, neither about any one signal)
+ * and whatever ClickHouse throws on a failed insert. All three must propagate: the
+ * runner turns them into an exit code, and swallowing any would commit offsets for
+ * rows that never landed.
  */
 export async function processBatch(
   deps: ConsumeDeps,
@@ -117,21 +119,38 @@ export async function processBatch(
   }
   if (messages.length === 0) return { ...empty, ms: now() - startedAt }
 
-  // Resolve concurrently; results are written back BY INDEX because the pool
-  // finishes out of order and the prefix rule below depends on topic order.
+  // Positional throughout: the prefix rule below depends on TOPIC order, and the
+  // resolver returns its verdicts in the order the messages were sent.
   const verdicts = new Array<ResolveVerdict | null>(messages.length).fill(null)
   const failures = new Array<number>(messages.length).fill(0)
 
-  await mapWithConcurrency(messages, config.concurrency, async (message, index) => {
+  // ONE call per chunk. A poll under `batchMax` is exactly one call; the loop
+  // exists because a poll can exceed the route's own cap.
+  const width = Math.max(1, config.batchMax)
+  for (let start = 0; start < messages.length; start += width) {
+    // Between chunks, not between signals. One call cannot outlast the broker's
+    // session timeout the way 500 sequential ones could.
     await deps.onProgress?.()
-    const verdict = await resolve.resolve(message)
-    verdicts[index] = verdict
-    // Counted ONCE, here — the loop below only reads what this recorded. A
-    // transient failure is the only kind that says anything about the route's
-    // health; a rejection is a perfectly healthy answer.
-    if (verdict.kind === 'transient') failures[index] = health.recordFailure(message.signalId)
-    else health.recordSuccess(message.signalId)
-  })
+
+    const chunk = messages.slice(start, start + width)
+    const answered = await resolve.resolveBatch(chunk)
+
+    for (const [offset, verdict] of answered.entries()) {
+      const index = start + offset
+      const message = messages[index]
+      if (!message) continue
+      verdicts[index] = verdict
+      // Counted ONCE, here — the loop below only reads what this recorded. A
+      // transient failure is the only kind that says anything about the route's
+      // health; a rejection is a perfectly healthy answer.
+      if (verdict.kind === 'transient') failures[index] = health.recordFailure(message.signalId)
+      else health.recordSuccess(message.signalId)
+    }
+
+    // The call itself failed, so the prefix stops inside this chunk no matter
+    // what the remaining chunks would say. Stop asking.
+    if (callFailed(answered)) break
+  }
 
   const rows: SignalLogInsert[] = []
   let stoppedAt = -1
@@ -142,32 +161,32 @@ export async function processBatch(
   for (const [index, message] of messages.entries()) {
     const verdict = verdicts[index]
     if (!verdict) {
-      // The pool exited early — only possible if a worker threw, which means the
-      // throw is already on its way up. Stop the prefix here regardless.
+      // A chunk was never asked (the call above failed and we stopped early), or
+      // the resolver returned short. Either way this message has no answer, so
+      // the prefix ends here and it is redelivered.
       stoppedAt = index
       break
     }
 
     if (verdict.kind === 'transient') {
-      // Poison, or an outage? BOTH conditions are required, and neither alone is
-      // enough:
+      // Poison, or an outage? BOTH conditions are still required, but the second
+      // is now EVIDENCE rather than inference:
       //
       //   the signal has failed `poisonAfter` times in a row              AND
-      //   some OTHER call has succeeded SINCE that streak began
+      //   the route ANSWERED this time (a per-item transient inside a 200)
       //
-      // The second is the definition of poison, not a safety margin. An
-      // elapsed-time proxy is not equivalent and was observed failing: five
-      // failures accumulate in about five seconds, so a success from 70 seconds
-      // ago still sat inside a two-minute outage window and made a route that was
-      // demonstrably down look alive — archiving a good signal as a caller error
-      // during a real outage.
+      // `routeAnswered` is what the old `succeededSinceStreak` was trying to
+      // approximate. It had to compare a monotonic success COUNT — five failures
+      // accumulate in about five seconds, so an elapsed-time proxy let a success
+      // from 70 seconds earlier make a route that was demonstrably down look
+      // alive, and archived a good signal as a caller error during a real outage.
+      // With one call per batch there is nothing to approximate: either the call
+      // came back or it did not.
       //
-      // With nothing succeeding there is nothing to call this signal poison
-      // against, so the batch stalls and the RUNNER decides: once nothing has
-      // answered for RESOLVE_OUTAGE_MS it exits, systemd backs off, and every
-      // signal stays safe on the topic.
-      const routeIsAnswering = health.succeededSinceStreak(message.signalId)
-      if ((failures[index] ?? 0) < config.poisonAfter || !routeIsAnswering) {
+      // When it did not, nothing in the batch is poison, so the batch stalls and
+      // the RUNNER decides: once nothing has answered for RESOLVE_OUTAGE_MS it
+      // exits, systemd backs off, and every signal stays safe on the topic.
+      if (!verdict.routeAnswered || (failures[index] ?? 0) < config.poisonAfter) {
         stoppedAt = index
         break
       }

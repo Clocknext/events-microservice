@@ -87,7 +87,7 @@ async function main() {
     ids.forEach(remember)
     console.log(`  ${ids.length}/50 accepted at the edge — nothing else was told`)
 
-    // Wait for ClickHouse's Kafka engine to ingest them; the run reads the
+    // Wait for the CONSUMER to resolve and archive them; the run reads the
     // archive, so anything not yet ingested simply is not in the window.
     const until = Date.now() + 60_000
     while (Date.now() < until) {

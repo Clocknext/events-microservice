@@ -262,10 +262,17 @@ $(bold "════════════════════════
   $(bold "2 · the edge")           — POST /api/v1/signal, on :$PORT
       cd $ROOT && npm run dev
 
-  $(bold "3 · the dispatcher")     — archive → $PAY_URL/api/internal/settle
-      cd $ROOT && npm run dispatch
+  $(bold "3 · the consumer")       — topic → $PAY_URL/api/internal/resolve → ClickHouse
+      cd $ROOT && npm run consume
+      LONG-LIVED: leave it running. ClickHouse does NOT ingest from Kafka any
+      more, so without this nothing ever reaches signal_log and the dispatcher
+      has nothing to read. Ctrl-C to stop.
 
-  All three read $ROOT/.env — nothing needs exporting.
+  $(bold "4 · the dispatcher")     — archive → $PAY_URL/api/internal/settle
+      cd $ROOT && npm run dispatch
+      ONE-SHOT: it runs a single window and exits. Run it again for another.
+
+  All four read $ROOT/.env — nothing needs exporting.
 
   $(bold "smoke test")
       curl -s -X POST http://127.0.0.1:$PORT/api/v1/signal \\

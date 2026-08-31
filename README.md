@@ -146,8 +146,9 @@ the gotchas that have already cost time.
 
 The edge runs on EC2 under `edge.service`; the dispatcher runs as two systemd
 timers in [deploy/systemd/](deploy/systemd/) — the 1-minute pipeline run and the
-hourly reconciliation. Both expect the repository at `/srv/events-microservice`.
-There is no supervised long-lived dispatcher process.
+hourly reconciliation. Every unit expects the checkout at
+`/home/ubuntu/events-microservice` and runs as `ubuntu` — the user that owns the
+tree and runs the deploy. There is no supervised long-lived dispatcher process.
 
 Terraform for the edge's own AWS footprint — IAM role, deploy bucket, EC2
 instance, ALB — lives in [infra/aws/](infra/aws/README.md). It validates but has
