@@ -114,6 +114,27 @@ export const config = {
    *  code change or a cursor to rewind. */
   dispatchSince: process.env.DISPATCH_SINCE ?? '',
   dispatchUntil: process.env.DISPATCH_UNTIL ?? '',
+  /**
+   * FIRE AND FORGET: send the settle body and exit without reading the reply.
+   *
+   * Off by default, and understand what it costs before turning it on. The run
+   * stops learning ANYTHING about the outcome: `processed`, `userError` and
+   * `serverError` are all reported as 0 because there is no response to count,
+   * a refused shared secret no longer exits 2, and a 413 no longer raises
+   * `PayloadTooLargeError`. A totally broken settle route looks exactly like a
+   * healthy one, forever.
+   *
+   * It is also not free on the OTHER side. Hanging up mid-request lets the
+   * platform cancel the function while it is still pricing — the same failure the
+   * settle route documents for a tunnel's 100s cut: rows committed to `SignalLog`
+   * with no matching `SignalStatus`, which is money written with no bookkeeping.
+   *
+   * What it does guarantee is delivery of the REQUEST: the send resolves on the
+   * request stream's `finish`, meaning the whole body reached the kernel, never
+   * merely that it was queued.
+   */
+  dispatchFireAndForget:
+    (process.env.DISPATCH_FIRE_AND_FORGET ?? 'false').toLowerCase() === 'true',
 
   // --- the consumer (Kafka -> resolve -> ClickHouse) --------------------------
   //

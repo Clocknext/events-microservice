@@ -171,7 +171,7 @@ export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
   }
   if (signals.length === 0) return { ...empty, skipped, ms: now() - startedAt }
 
-  const { results, bytes, gzipBytes } = await payments.settle(batchId, signals)
+  const { results, bytes, gzipBytes, fireAndForget } = await payments.settle(batchId, signals)
 
   // Counted from what the ARCHIVE said, not from what settle answered: a signal
   // the consumer already rejected was never priced, so counting it as a settle
@@ -179,6 +179,9 @@ export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
   let pending = 0
   for (const signal of signals) if (signal.status === 'PENDING') pending += 1
 
+  // Empty under fire-and-forget, because the reply was never read. The three
+  // counters below stay 0 and the outcome carries `fireAndForget` so the log line
+  // says WHY they are 0 — a run that priced nothing looks the same otherwise.
   let processed = 0
   let userError = 0
   let serverError = 0
@@ -201,5 +204,6 @@ export async function runOnce(deps: RunDeps): Promise<RunOutcome> {
     gzipBytes,
     ms: now() - startedAt,
     batchId,
+    ...(fireAndForget ? { fireAndForget } : {}),
   }
 }

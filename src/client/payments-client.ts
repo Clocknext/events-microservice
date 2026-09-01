@@ -7,6 +7,8 @@
  *  signal's `apiKeyHash` rides in the body and the payments app resolves the
  *  organisation from it, so the raw `cnk_…` key stays in the edge process. */
 import { gzip as gzipCb } from 'node:zlib'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { promisify } from 'node:util'
 import { config } from '../config.js'
 import type { SettleResult, SettleSignal, SettleTransfer } from '../workers/dispatch/dispatch.schema.js'
@@ -50,20 +52,80 @@ function readEnvelope<T>(status: number, body: string, route: string): T {
 }
 
 /**
+ * Writes the body and resolves the moment it is fully flushed — WITHOUT waiting
+ * for, or reading, the reply.
+ *
+ * `fetch()` cannot express this. Its promise settles when response HEADERS
+ * arrive, and settle is not a streaming route: Next.js emits headers only once
+ * the handler has returned, so awaiting `fetch` is awaiting the whole pricing
+ * run. Dropping to `node:http` gives access to the request stream's `finish`
+ * event, which fires when the last byte of the body has been handed to the
+ * kernel — the earliest moment at which the send is genuinely complete.
+ *
+ * `finish`, not `end()`'s callback queue and not a timer: anything looser would
+ * let the process exit with part of the body still in a userland buffer, and the
+ * run would report a send that never happened.
+ */
+function sendWithoutWaiting(
+  url: URL,
+  headers: Record<string, string>,
+  body: Buffer,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const https = url.protocol === 'https:'
+    const req = (https ? httpsRequest : httpRequest)({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port !== '' ? url.port : https ? 443 : 80,
+      path: `${url.pathname}${url.search}`,
+      method: 'POST',
+      // Explicit, because without it node falls back to chunked encoding and
+      // some edges buffer a chunked body before forwarding it.
+      headers: { ...headers, 'content-length': String(body.length) },
+      timeout: timeoutMs,
+    })
+    // Only failures BEFORE the body is away can be reported. Once `finish` has
+    // fired the promise is already settled and a later socket error is moot —
+    // the request is gone and nobody is listening for the answer by design.
+    req.on('error', reject)
+    req.on('timeout', () => {
+      req.destroy(new Error(`settle did not accept the body within ${timeoutMs}ms`))
+    })
+    // If the reply beats our exit, drain it so the socket is not left half-open.
+    // Nothing is parsed: not the status, not the envelope. That is the trade.
+    req.on('response', (res) => res.resume())
+    req.on('finish', () => {
+      // Stop the pending response holding the event loop open — the runner exits
+      // on its own, and waiting for a reply is the thing being avoided.
+      req.socket?.unref()
+      resolve()
+    })
+    req.end(body)
+  })
+}
+
+/**
  * Settles the WHOLE window in one call and returns a result per signal.
  *
  * Throws on a transport failure or a non-200 — which the runner treats as "this
- * window is unresolved". That is safe rather than lossy: the next run's window
- * overlaps this one, so it sends the same signals again, and settle replays them
- * onto the same money rows rather than charging twice (`SignalLog.signalId` is
- * unique and is the idempotency key). Nothing needs to be recorded for that to
- * work, which is the entire reason this process keeps no state.
+ * window is unresolved". Historically that was safe rather than lossy because
+ * the next run's window overlapped this one. With `DISPATCH_WINDOW_MS` equal to
+ * the cron interval the windows TILE instead, so a failed run is covered by the
+ * hourly reconciliation rather than by the next minute. Settle stays idempotent
+ * on `SignalLog.signalId` either way, so a replay lands on the same money row.
  *
  * THE BODY IS GZIPPED. Vercel caps a serverless function's request body at
  * 4.5MB and raw signal JSON crosses that somewhere around 15k signals — well
  * inside one window at production volume. Signal JSON is the same keys repeated
  * thousands of times, so it compresses roughly 10:1 and the ceiling stops being
  * the thing that decides the window width.
+ *
+ * WITH `DISPATCH_FIRE_AND_FORGET` the reply is never read: the call returns as
+ * soon as the body is flushed, `results` comes back empty, and no status is
+ * inspected — so a refused secret cannot raise `MisconfiguredError` and a 413
+ * cannot raise `PayloadTooLargeError` from this path. See the flag's note in
+ * config.ts for what that costs.
  */
 export async function settleAll(
   batchId: string,
@@ -80,6 +142,14 @@ export async function settleAll(
     authorization: `Bearer ${config.internalSecret}`,
   }
   if (config.dispatchGzip) headers['content-encoding'] = 'gzip'
+
+  if (config.dispatchFireAndForget) {
+    await sendWithoutWaiting(url, headers, body, config.dispatchTimeoutMs)
+    // No results, and that is not "settle returned nothing" — nobody looked. The
+    // caller marks the outcome `fireAndForget` so a run of zeroes is not read as
+    // a batch that failed to price.
+    return { results: [], bytes: raw.length, gzipBytes: body.length, fireAndForget: true }
+  }
 
   const res = await fetch(url, {
     method: 'POST',

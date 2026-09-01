@@ -138,6 +138,11 @@ export interface SettleTransfer {
   results: SettleResult[]
   bytes: number
   gzipBytes: number
+  /** The reply was never read (`DISPATCH_FIRE_AND_FORGET`), so `results` is empty
+   *  because nobody looked — NOT because settle answered with nothing. Without
+   *  this flag a fire-and-forget run and a run whose whole batch failed to price
+   *  produce an identical line of zeroes. */
+  fireAndForget?: boolean
 }
 
 export interface SettleClient {
@@ -170,4 +175,9 @@ export interface RunOutcome {
   gzipBytes: number
   ms: number
   batchId: string
+  /** The reply was never read. `processed`, `userError` and `serverError` are all
+   *  0 for that reason ALONE — read them as "unknown", never as "nothing priced".
+   *  `read`/`sent`/`pending` are still true: they come from the archive, not from
+   *  settle. */
+  fireAndForget?: boolean
 }
