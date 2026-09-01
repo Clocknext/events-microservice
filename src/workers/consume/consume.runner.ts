@@ -159,10 +159,36 @@ export async function run(): Promise<void> {
     ...(config.kafkaUseIam ? { ssl: true, sasl: iamSasl() } : {}),
   })
 
+  // THE SESSION TIMEOUT MUST EXCEED THE LONGEST SINGLE BLOCKING CALL, and it is
+  // DERIVED rather than written down so the two cannot drift apart again.
+  //
+  // Nothing heartbeats DURING a resolve call — `onProgress` runs between chunks,
+  // not inside one — so a call that blocks for its full timeout is a window in
+  // which the broker hears nothing at all. When `RESOLVE_TIMEOUT_MS` and this
+  // value were both 30s, ONE slow call was enough, and it was observed against the
+  // live broker with a tunnel restart as the slow call:
+  //
+  //   · the call blocked ~30s with no heartbeat
+  //   · the coordinator dropped the member
+  //   · the batch finished, resolved on retry, and the row WAS archived
+  //   · `commitOffsets` then failed — "The coordinator is not aware of this
+  //     member" — so the offset never moved and the process exited 1
+  //
+  // The redeliver path did its job, but note what it costs: the commit throws
+  // BEFORE `line('batch', …)`, so a consumer failing this way logs no `batch`
+  // lines at all and looks idle while it churns.
+  //
+  // Two resolve timeouts plus a margin: one in-flight call, one kafkajs retry, and
+  // room for the ClickHouse insert that follows.
+  const sessionTimeout = Math.max(30_000, config.resolveTimeoutMs * 2 + 15_000)
+
   const consumer: Consumer = kafka.consumer({
     groupId: config.consumeGroupId,
-    sessionTimeout: 30_000,
+    sessionTimeout,
     heartbeatInterval: 3_000,
+    // Must be at least `sessionTimeout`, or a rebalance can expire while a batch
+    // is still being processed.
+    rebalanceTimeout: sessionTimeout,
     // Two attempts, then crash and let systemd restart. A long in-process retry
     // ladder would only hide an outage the exit code is supposed to announce.
     retry: { retries: 2, initialRetryTime: 1_000 },
@@ -182,6 +208,10 @@ export async function run(): Promise<void> {
     topic: config.kafkaTopic,
     groupId: config.consumeGroupId,
     batchMax: config.resolveBatchMax,
+    // Logged so the pairing is visible at startup: sessionTimeout must stay
+    // comfortably above resolveTimeoutMs.
+    resolveTimeoutMs: config.resolveTimeoutMs,
+    sessionTimeout,
     iam: config.kafkaUseIam,
   })
 
@@ -282,6 +312,7 @@ export async function run(): Promise<void> {
       // Kafka offsets outgrow Number.MAX_SAFE_INTEGER on a long-lived topic.
       const lastSafe = safeUntil > 0 ? batch.messages[safeUntil - 1] : undefined
       if (lastSafe) {
+        try {
         await consumer.commitOffsets([
           {
             topic: batch.topic,
@@ -289,6 +320,24 @@ export async function run(): Promise<void> {
             offset: (BigInt(lastSafe.offset) + 1n).toString(),
           },
         ])
+        } catch (error) {
+          // LOG THE BATCH BEFORE RETHROWING. A failed commit used to throw
+          // straight past the `line('batch', …)` below, so a consumer stuck in
+          // this exact failure produced NO batch lines at all — it looked idle
+          // while it churned, resolved and inserted rows, and exited 1 every
+          // time. That went unnoticed for hours against the live broker.
+          //
+          // `committed: 0` is the honest number: the rows landed, the offset did
+          // not, and the batch WILL be redelivered.
+          line('batch', {
+            partition: batch.partition,
+            ...outcome,
+            unparsable,
+            committed: 0,
+            commitFailed: error instanceof Error ? error.message : String(error),
+          })
+          throw error
+        }
       }
 
       line('batch', {

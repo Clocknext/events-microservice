@@ -134,6 +134,11 @@ export async function processBatch(
 
     const chunk = messages.slice(start, start + width)
     const answered = await resolve.resolveBatch(chunk)
+    // AND immediately after, not only before. The call itself is an unheartbeated
+    // gap — the broker hears nothing for as long as it blocks — so liveness is
+    // re-established the moment it returns rather than at the next chunk, which on
+    // a single-chunk batch would be never.
+    await deps.onProgress?.()
 
     for (const [offset, verdict] of answered.entries()) {
       const index = start + offset
