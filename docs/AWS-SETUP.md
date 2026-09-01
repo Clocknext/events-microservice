@@ -8,15 +8,23 @@ type, and what you should see afterwards.
 "✓ Check" box. Almost every way this deployment goes wrong is caught by one of
 them, and finding out four steps later is what turns an afternoon into a weekend.
 
-**What you end up with:** two Linux servers, a managed database, and two AWS
-networking pieces in front. Roughly **$40–52/month**, so about four months on the
-$200 credit. [COSTS.md](COSTS.md) has the breakdown.
+**What you end up with:** two Linux servers, a managed database, and a load
+balancer in front. Roughly **$40–52/month**, so about four months on the $200
+credit. [COSTS.md](COSTS.md) has the breakdown.
+
+**CloudFront is deferred**, so the ALB is the public front door and
+`api.yourdomain.com` points straight at it. Creating a distribution needs a
+verified account, and nothing in this pipeline waits on one: the ALB already
+terminates HTTPS on your own certificate. Everything CloudFront would add — and
+the two settings that break it if you get them wrong — is kept intact in
+[Later — the CloudFront front door](#later--the-cloudfront-front-door), which also
+covers COSTS.md's assumption that it is there.
 
 ```
 customer
-   │ HTTPS  api.yourdomain.com
+   │ HTTPS  api.yourdomain.com      (CloudFront: deferred — see the end)
    ▼
-CloudFront ──▶ ALB ──▶ box-edge   t4g.small
+   ALB ──────────────▶ box-edge   t4g.small
                        ├─ edge      Fastify :3000
                        ├─ consumer  systemd SERVICE — always on
                        └─ dispatch  systemd timers (1 min + hourly)
@@ -69,8 +77,7 @@ SG-KAFKA ID             = sg-...............
 ELASTIC IP              = ..................  (Step 6)
 BOX-KAFKA PRIVATE IP    = 10.................  (Step 7)
 KAFKA SCRAM PASSWORD    = ..................  (Step 10 — LEGACY, see Step 12)
-ALB DNS NAME            = ..........elb.amazonaws.com  (Step 14)
-CLOUDFRONT DOMAIN       = d.........cloudfront.net     (Step 15)
+ALB DNS NAME            = ..........elb.amazonaws.com  (Step 14 — api.* points here)
 INTERNAL_SETTLE_SECRET  = ..................
 ```
 
@@ -78,7 +85,7 @@ INTERNAL_SETTLE_SECRET  = ..................
 
 ## Step 0 — The words AWS uses
 
-You do not need to understand AWS to follow this. You do need these nine words,
+You do not need to understand AWS to follow this. You do need these eight words,
 because the console assumes them. Read once, then move on.
 
 | Word | What it actually is | Analogy |
@@ -91,7 +98,9 @@ because the console assumes them. Read once, then move on.
 | **EC2 instance** | a virtual Linux server you SSH into | a rented computer |
 | **Elastic IP (EIP)** | a public IP address that does not change | a permanent street address |
 | **ALB** | load balancer: takes HTTPS, forwards to your server, health-checks it | the receptionist |
-| **CloudFront** | AWS's CDN — the public front door, close to your users | the front gate |
+
+A ninth, **CloudFront** — AWS's CDN, the front gate you would normally put in
+front of the ALB — is deferred here and never appears in Steps 1–17.
 
 Two facts about regions that cause 90 % of beginner confusion:
 
@@ -382,8 +391,10 @@ For **each** of the three names below:
 
 3. **Save rules**.
 
-This is intentionally open — it is the public front door. Step 17 tightens it so
-only CloudFront can use it.
+This is intentionally open, and **stays open**: with CloudFront deferred, the ALB
+*is* the public front door. Narrowing 443 to CloudFront's prefix list is the first
+thing to do when the distribution lands — see
+[Later — the CloudFront front door](#later--the-cloudfront-front-door).
 
 ### 5.3 Add rules to `sg-edge`
 
@@ -1598,55 +1609,12 @@ here — the certificate is for `api.yourdomain.com`, not the ALB's own name.
 
 ---
 
-## Step 15 — CloudFront
+## Step 15 — Point your domain at the ALB
 
-### 15.1 The certificate CloudFront will use
-
-CloudFront reads certificates **only** from `us-east-1`, whatever region the rest of
-your stack is in.
-
-> **If your `REGION` is already `us-east-1`: skip this section entirely.** The
-> certificate you made in Step 14.1 is already in the right place — reuse it in 15.2
-> and you are done. One certificate, one GoDaddy CNAME. This is a real perk of
-> deploying in `us-east-1` and it partly offsets the ~17 % that `ap-south-1` would
-> have saved you.
-
-**Otherwise**, you need a second certificate for the same hostname:
-
-1. **Certificate Manager** → **switch the region dropdown to `us-east-1`**.
-2. Request a public certificate for `api.yourdomain.com`, DNS validation — exactly
-   as in 14.1.
-3. Add the new CNAME it gives you in GoDaddy, **alongside** the first one. They are
-   different records; keep both.
-4. **✓ Check:** status **Issued**.
-
-### 15.2 Create the distribution
-
-1. Top search bar → **CloudFront** → **Create distribution**.
-2. **Origin domain**: your `ALB DNS NAME`.
-3. **Protocol**: **HTTPS only**.
-4. **Default cache behavior**:
-   - **Viewer protocol policy**: **Redirect HTTP to HTTPS**
-   - **Allowed HTTP methods**: **GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE**
-   - **Cache policy**: **CachingDisabled**
-   - **Origin request policy**: **AllViewer**
-5. **Settings**:
-   - **Alternate domain name (CNAME)**: `api.yourdomain.com`
-   - **Custom SSL certificate**: the certificate from 15.1 — if the dropdown is
-     empty, your certificate is not in `us-east-1`
-6. **Create distribution**. Deployment takes ~5 minutes.
-7. Copy the **Distribution domain name** (`dxxxxx.cloudfront.net`) to your scratch
-   sheet.
-
-> **Two of those settings are not optional, and both fail confusingly:**
->
-> - **`AllViewer`** — without it CloudFront strips the `Authorization` header, and
->   every request arrives as **401 `API_KEY_MISSING`** even though your key is
->   correct.
-> - **`CachingDisabled`** — caching a `POST /api/v1/signal` response would hand one
->   caller's `signalId` to a different caller.
-
-### 15.3 Point your domain at it
+**CloudFront is deferred** — a distribution needs an AWS-verified account, and
+nothing here waits on one. The ALB is the public front door, and it already
+terminates HTTPS with the certificate you issued in 14.1 for
+`api.yourdomain.com`. So this step is one DNS record, not a CDN.
 
 1. GoDaddy → **Add New Record**:
 
@@ -1654,21 +1622,55 @@ your stack is in.
 | --- | --- |
 | Type | **CNAME** |
 | Name | **`api`** |
-| Value | `dxxxxx.cloudfront.net` — no `https://`, no trailing slash |
+| Value | your `ALB DNS NAME`, **with a trailing dot** — e.g. `alb-edge-1234567890.ap-south-1.elb.amazonaws.com.` No `https://`, no trailing slash |
 | TTL | 600 |
 
 2. **Save**.
 
-**✓ Check:**
+> **The trailing dot on the VALUE is not decoration, and this is the single most
+> common way this step fails.** A CNAME value without one is a *relative* name, so
+> the DNS host appends your own zone to it and saves
+> `alb-edge-….elb.amazonaws.com.yourdomain.com` — a hostname that does not exist.
+> The record looks right in the panel and resolves to nothing. If your host strips
+> the dot and appends the zone anyway, look for a "fully qualified" or "external
+> target" toggle; every panel has one, under some name.
+>
+> Note this is the **opposite** of the advice in 14.1, where a rejected trailing dot
+> could simply be dropped. That value is a name *inside* your zone, so appending the
+> zone is correct there. Here the target belongs to AWS.
+
+**✓ Check:** run the CNAME query **first** — it is the one that catches the two
+failures above, and the second query cannot distinguish them.
 
 ```bash
-dig +short api.yourdomain.com     # shows cloudfront.net, then IP addresses
+dig +short CNAME api.yourdomain.com    # EXACTLY the ALB's name — nothing may follow .com
+dig +short api.yourdomain.com          # then the ALB's two or more IPs
+curl -s https://api.yourdomain.com/health | jq
 ```
 
-> **Why CNAME and not A?** CloudFront's IP addresses change constantly, so you point
-> at its *name* and let AWS move it underneath. This only works on a subdomain — a
-> CNAME on a bare domain is invalid DNS. That is exactly why the API lives at
-> `api.yourdomain.com` rather than `yourdomain.com`.
+An **empty** first line means the record is not there under the name you queried —
+check the **Name** field, and check it against the hostname on your certificate
+rather than what you meant to type. `openssl s_client -connect <ALB DNS NAME>:443 \
+-servername <ALB DNS NAME> </dev/null 2>/dev/null | openssl x509 -noout -subject`
+prints the name the ALB is actually built for.
+
+That `curl` has **no `-k`**, and that is the whole point of the step. In 14.3 you
+needed `-k` because the certificate names `api.yourdomain.com` and you were calling
+the ALB's own hostname. Now the name matches and TLS validates on its own. If it
+still complains, DNS has not propagated — wait out the TTL and re-check `dig`.
+
+> **Why CNAME and not A?** An ALB's IP addresses change without notice; AWS
+> replaces the nodes behind the name. You point at the *name* and let it move
+> underneath you. This only works on a subdomain — a CNAME on a bare domain is
+> invalid DNS — which is exactly why the API lives at `api.yourdomain.com` and not
+> at `yourdomain.com`. The same constraint applies to CloudFront later, so this
+> record is the one you edit then, not one you delete.
+
+> **The ALB's `…elb.amazonaws.com` name stays reachable too**, serving the same app
+> over a certificate that does not match it. While the ALB is the front door that
+> is cosmetic — same edge, same API keys, same rejections, just a name mismatch
+> `-k` papers over. It only becomes a *bypass* once something is meant to sit in
+> front, which is why closing it is part of the deferred section rather than Step 17.
 
 ---
 
@@ -1687,7 +1689,7 @@ Then walk the six hops. Each has its own place to look:
 
 | Hop | Where to check |
 | --- | --- |
-| 1. CloudFront → ALB → edge | the response above: **202** with a `signalId` |
+| 1. DNS → ALB → edge | the response above: **202** with a `signalId` |
 | 2. edge → Kafka | box-edge: `journalctl -u edge -f` |
 | 3. Kafka → consumer → resolve | box-edge: `journalctl -u signal-consumer -f -o cat` — a `batch` line whose `processing` count went up |
 | 4. consumer → ClickHouse | SQL console: `SELECT status, organization_id, error_code FROM signals.signal_log WHERE signal_id = '<id>'` |
@@ -1735,32 +1737,44 @@ curl -s -X POST $BASE/api/v1/signal \
 Every rejection must **still carry `signalId` and `receivedAt`** — they are stamped
 before anything can fail, so a caller can quote even a hard 404 back at you.
 
-> **Expect hops 5 and 6 to fail until the payments side catches up.** Settle must
-> accept one call of arbitrary size (its 500-signal cap removed, its per-signal loop
-> replaced by a bulk insert), decompress a gzipped request body, and now also
-> **trust the verdict** — using the `organizationId` the consumer resolved instead of
-> re-deriving it, and recording a `PENDING` signal's failure without pricing it.
-> Until those land, the failure is upstream, not your AWS wiring. Hops 1–4 are the
-> real test of this deployment, and hop 3 is the new one.
+> **All six hops should work.** The payments side landed on
+> `microservices/events`: resolve takes a batch (capped at 5,000 — the consumer
+> sends 2,000) and reserves `401` for the shared secret alone, and settle takes a
+> whole window (`MAX_BATCH = 200_000`, `maxDuration = 300`), decompresses gzip, and
+> trusts the `organizationId` the consumer resolved rather than re-deriving it.
+> If hop 5 or 6 fails, it is a real failure worth reading — not an expected gap.
+> Hop 3 is the newest one and the most worth watching.
 
 ---
 
 ## Step 17 — Lock it down, then watch it
 
-### 17.1 Close the ALB to the public
+### 17.1 The ALB is the front door — keep its door narrow
 
-CloudFront is now the intended front door, so the ALB should only accept traffic
-from CloudFront.
+With CloudFront deferred there is nothing to restrict `sg-alb` *to*: its 443 rule
+stays open to `0.0.0.0/0`, because that is the public entrance. What matters is
+that 443 is the **only** thing open, and that the edge itself is not.
 
-1. **EC2** → **Security Groups** → **`sg-alb`** → **Edit inbound rules**.
-2. On the 443 rule, change **Source** from `Anywhere-IPv4` to **Custom**, then
-   search for and select the managed prefix list
-   **`com.amazonaws.global.cloudfront.origin-facing`**.
-3. **Save rules**.
+1. **EC2** → **Security Groups** → **`sg-alb`** → **Inbound rules**.
+2. There should be exactly **one** rule: HTTPS 443 from `Anywhere-IPv4`. Delete
+   anything else — a port 80 rule left over from a test, an SSH rule that never
+   belonged on a load balancer.
+3. On **`sg-edge`**, confirm port 3000's source is still the security group
+   **`sg-alb`** and not an IP or `0.0.0.0/0`. That rule is the only thing keeping
+   the edge off the public internet.
 
-**✓ Check:** `curl -sk https://<ALB DNS NAME>/health` now times out, while
-`curl -s https://api.yourdomain.com/health` still works. Without this,
-anyone who discovers the ALB's DNS name bypasses CloudFront entirely.
+**✓ Check:** the domain works and the instance does not.
+
+```bash
+curl -s https://api.yourdomain.com/health | jq                       # 200
+curl -s --connect-timeout 5 http://<box-edge PUBLIC IP>:3000/health  # must hang, then fail
+```
+
+> The rule that changes when CloudFront lands is this one: 443's source becomes the
+> managed prefix list `com.amazonaws.global.cloudfront.origin-facing`, so the ALB
+> stops answering anyone who found its `…elb.amazonaws.com` name. Until then that
+> name answers, which is expected — see
+> [Later — the CloudFront front door](#later--the-cloudfront-front-door).
 
 ### 17.2 Confirm the firewalls are tight
 
@@ -1862,6 +1876,136 @@ record at GoDaddy. Keep the Elastic IP — box-kafka still uses it for outbound.
 
 ---
 
+## Later — the CloudFront front door
+
+**Deferred, not abandoned.** Creating a distribution requires an AWS account that
+has been through identity verification, and nothing in this pipeline is blocked by
+its absence. Steps 1–17 give you a working, HTTPS-terminated, firewalled
+deployment on the ALB alone. This section is the delta to add when the account
+clears — nothing above it needs to be undone, and the `api` CNAME from Step 15 is
+edited rather than replaced.
+
+**What you actually gain**, in the order it matters for this API:
+
+| Gain | Why it is real here |
+| --- | --- |
+| **Egress cost** | AWS origin → CloudFront transfer is free, and CloudFront's own 1 TB/month egress is free *forever*, not for 12 months. It removes the ALB's internet egress rather than adding a layer on top of it — see [COSTS.md](COSTS.md) §CloudFront on a POST-only route |
+| **A shield in front of the ALB** | the origin stops answering the public internet at all; only the CDN's prefix list gets in |
+| **TLS terminated near the caller** | the handshake finishes at an edge location instead of crossing to your region — the round trips, not the payload, are what a small POST pays for |
+| **AWS WAF and rate limiting** | attach at the distribution when you want them |
+
+Caching is **not** among them, and must stay off: see the two settings below.
+
+> **COSTS.md and PRODUCTION.md both describe the topology *with* CloudFront** —
+> that is the intended end state, and it is what the modelled numbers assume. Until
+> this section is done, read every CloudFront line in them as pending.
+
+### L.1 The certificate CloudFront will use
+
+CloudFront reads certificates **only** from `us-east-1`, whatever region the rest of
+your stack is in.
+
+> **If your `REGION` is already `us-east-1`: skip this section entirely.** The
+> certificate you made in Step 14.1 is already in the right place — reuse it in L.2
+> and you are done. One certificate, one GoDaddy CNAME. This is a real perk of
+> deploying in `us-east-1` and it partly offsets the ~17 % that `ap-south-1` would
+> have saved you.
+
+**Otherwise**, you need a second certificate for the same hostname:
+
+1. **Certificate Manager** → **switch the region dropdown to `us-east-1`**.
+2. Request a public certificate for `api.yourdomain.com`, DNS validation — exactly
+   as in 14.1.
+3. Add the new CNAME it gives you in GoDaddy, **alongside** the first one. They are
+   different records; keep both, and keep the Step 14.1 one too — the ALB is still
+   the origin and still needs its own certificate to renew.
+4. **✓ Check:** status **Issued**.
+
+### L.2 Create the distribution
+
+1. Top search bar → **CloudFront** → **Create distribution**.
+2. **Origin domain**: your `ALB DNS NAME`.
+3. **Protocol**: **HTTPS only**.
+4. **Default cache behavior**:
+   - **Viewer protocol policy**: **Redirect HTTP to HTTPS**
+   - **Allowed HTTP methods**: **GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE**
+   - **Cache policy**: **CachingDisabled**
+   - **Origin request policy**: **AllViewer**
+5. **Settings**:
+   - **Alternate domain name (CNAME)**: `api.yourdomain.com`
+   - **Custom SSL certificate**: the certificate from L.1 — if the dropdown is
+     empty, your certificate is not in `us-east-1`
+6. **Create distribution**. Deployment takes ~5 minutes.
+7. Copy the **Distribution domain name** (`dxxxxx.cloudfront.net`) to your scratch
+   sheet.
+
+> **Two of those settings are not optional, and both fail confusingly:**
+>
+> - **`AllViewer`** — without it CloudFront strips the `Authorization` header, and
+>   every request arrives as **401 `API_KEY_MISSING`** even though your key is
+>   correct.
+> - **`CachingDisabled`** — caching a `POST /api/v1/signal` response would hand one
+>   caller's `signalId` to a different caller.
+
+**✓ Check, before touching DNS:** the distribution serves the app under its own
+name, so nothing is at stake if it does not.
+
+```bash
+curl -s https://dxxxxx.cloudfront.net/health | jq
+```
+
+### L.3 Move the domain onto it
+
+Edit the **`api`** CNAME you created in Step 15 — do not add a second one. Two
+CNAMEs on the same name is not a failover, it is broken DNS.
+
+| Field | Value |
+| --- | --- |
+| Type | **CNAME** |
+| Name | **`api`** |
+| Value | `dxxxxx.cloudfront.net.` — **keep the trailing dot**, exactly as in Step 15; no `https://`, no trailing slash |
+| TTL | 600 |
+
+**✓ Check:**
+
+```bash
+dig +short api.yourdomain.com     # now shows cloudfront.net, then IP addresses
+curl -s https://api.yourdomain.com/health | jq
+
+# and the one that proves AllViewer took — a real key must still authenticate
+curl -s -X POST https://api.yourdomain.com/api/v1/signal \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <a real cnk_ key>' \
+  -d '{"customerId":"cus_real","inputTokens":1,"outputTokens":1}' | jq
+```
+
+A **202** means the header survived the hop. A **401 `API_KEY_MISSING`** on a key
+that worked in Step 16 means the origin request policy is not `AllViewer`, and
+nothing else.
+
+### L.4 Close the ALB to the public
+
+Only now is the ALB's own hostname a bypass. Shut it.
+
+1. **EC2** → **Security Groups** → **`sg-alb`** → **Edit inbound rules**.
+2. On the 443 rule, change **Source** from `Anywhere-IPv4` to **Custom**, then
+   search for and select the managed prefix list
+   **`com.amazonaws.global.cloudfront.origin-facing`**.
+3. **Save rules**.
+
+**✓ Check:** `curl -sk https://<ALB DNS NAME>/health` now times out, while
+`curl -s https://api.yourdomain.com/health` still works. Do this in that order —
+if the second one fails, put the rule back before debugging, because the API is
+down while it is wrong.
+
+| Symptom, once CloudFront is in | Almost always |
+| --- | --- |
+| Everything 401 through CloudFront | origin request policy isn't **AllViewer** |
+| Two callers see each other's `signalId` | cache policy isn't **CachingDisabled** |
+| 502/504 from CloudFront after L.4 | the prefix list rule replaced 443 instead of narrowing it, or the origin protocol isn't **HTTPS only** |
+
+---
+
 ## If something is wrong
 
 | Symptom | Almost always |
@@ -1883,7 +2027,9 @@ record at GoDaddy. Keep the Elastic IP — box-kafka still uses it for outbound.
 | Consumer runs, archive stays empty | the topic has nothing new, or the group was seeded past it. `kafka-consumer-groups.sh --describe --group signal-resolver` and read `LAG` |
 | Consumer lag climbs and never drains | no longer the resolve call. Look at the ClickHouse insert and the payments database first; add partitions only on a measured symptom. `RESOLVE_BATCH_MAX` raises the size of one call, which is the lever that used to be `CONSUME_CONCURRENCY` |
 | Target group stuck **unhealthy** | `sg-edge`:3000 source must be `sg-alb`, not an IP |
-| Everything 401 through CloudFront | origin request policy isn't **AllViewer** |
+| `api.yourdomain.com` gives a certificate warning | DNS still points somewhere else, or the CNAME's **Name** field has the domain typed twice. `dig +short` must show the ALB's name |
+| `dig +short api.yourdomain.com` prints **nothing at all** | either no record under that name (check **Name**, and check the hostname on the ACM certificate — a record for `api` when the cert says `events` fails exactly like this), or the CNAME **value** lost its trailing dot and your zone got appended to it. `dig +short CNAME api.yourdomain.com` tells the two apart |
+| `api.yourdomain.com` resolves but times out | `sg-alb` has no 443 rule, or the CNAME points at the target group / instance rather than the ALB's DNS name |
 
 ---
 
@@ -1919,13 +2065,16 @@ record at GoDaddy. Keep the Elastic IP — box-kafka still uses it for outbound.
     processing/pending -> then dispatch.timer + dispatch-reconcile.timer
 14  ACM cert (your region) + GoDaddy CNAME -> target group :3000 /health
     -> ALB HTTPS 443 across two AZs -> curl -k the ALB
-15  cert for CloudFront (must be us-east-1; reuse step 14's if REGION=us-east-1)
-    -> CloudFront: CachingDisabled + AllViewer
-    -> GoDaddy CNAME api -> dxxxx.cloudfront.net
+15  GoDaddy CNAME api -> ALB DNS NAME -> curl WITHOUT -k now validates.
+    CloudFront is DEFERRED (needs a verified account) — the ALB is the front door
 16  verify six hops + three rejection modes + one PENDING round trip
-17  sg-alb 443 -> CloudFront prefix list; confirm sg-kafka tight; set alarms
-    (run.capped, consumer down, quarantined>0, consumer lag)
+17  sg-alb stays open on 443 and ONLY 443; sg-edge:3000 from sg-alb only;
+    confirm sg-kafka tight; set alarms (run.capped, consumer down,
+    quarantined>0, consumer lag)
 17.4 optional: the broker's public 9094 path had ONE user, ClickHouse Cloud.
     Drop the sg-kafka 9094 rule, the EXTERNAL listener, the cert, the kafka A
     record and the clickhouse SCRAM user
+ L  LATER, once the account is verified: cert in us-east-1 -> CloudFront with
+    CachingDisabled + AllViewer -> repoint the api CNAME -> THEN sg-alb 443 to
+    the cloudfront origin-facing prefix list
 ```

@@ -106,7 +106,9 @@ self-hosted ClickHouse case, and notes ClickPipes deltas where relevant.
 > **The provisioning runbook is [AWS-SETUP.md](AWS-SETUP.md)** and it is the
 > authority on the deployed shape: **two** EC2 boxes — `box-edge` (edge + dispatch
 > timers) and `box-kafka` (self-hosted Kafka, public `SASL_SSL` on 9094) — plus
-> ClickHouse Cloud, one ALB and one CloudFront distribution. **No MSK.** The MSK
+> ClickHouse Cloud and one ALB. **CloudFront is deferred** — it needs a verified
+> account, so `api.*` points straight at the ALB and AWS-SETUP.md's closing
+> "Later — the CloudFront front door" section holds the delta. **No MSK.** The MSK
 > path below is kept as the comparison that decision was made against; where the
 > two disagree, AWS-SETUP.md wins.
 

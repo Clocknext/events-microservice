@@ -11,9 +11,10 @@ THREE processes that share one codebase:
   an identity, produces it to Kafka, and answers 202.
 - **The consumer** (`src/workers/consume/`) — a LONG-LIVED Kafka consumer, the only
   always-on process here besides the edge. It drains the topic, calls the payments
-  app's `/api/internal/resolve` **once per signal** (whose key is this, and is this
-  body acceptable?), and writes the row **with that verdict** into ClickHouse. It
-  replaced ClickHouse's own Kafka ingestion, which could not make an HTTP call.
+  app's `/api/internal/resolve` **once per batch** (whose key is each of these, and
+  are these bodies acceptable?), and writes the rows **with those verdicts** into
+  ClickHouse. It replaced ClickHouse's own Kafka ingestion, which could not make
+  an HTTP call.
 - **The dispatcher** (`src/workers/dispatch/`) — a separate ONE-SHOT process on a
   60-second systemd timer, not a loop and not long-lived. It reads one window of
   the ClickHouse archive and posts all of it to the payments app's
@@ -26,7 +27,7 @@ customer ──▶ EDGE ──produce──▶ Kafka `signals`
              (202)                    │
                                       ▼
                                  CONSUMER ──▶ payments /api/internal/resolve
-                                      │            (one call per signal:
+                                      │            (ONE call per batch:
                                       │             whose key, and is it valid?)
                                       ▼
                           ClickHouse signal_log  ── the archive, row + VERDICT
@@ -120,7 +121,7 @@ src/
 | `npm run typecheck:scripts` | `scripts/**/*.mts` too — they are NOT in `tsconfig.json` |
 | `npm run build` | uses `tsconfig.build.json`, which **excludes** `*.test.ts` |
 | `npm start` | runs compiled `dist/server.js` |
-| `npm test` | `node --import tsx --test` — 95 tests, no infrastructure needed |
+| `npm test` | `node --import tsx --test` — 104 tests, no infrastructure needed |
 | `npm run e2e` | the full pipeline against live Kafka + ClickHouse + Postgres |
 | `npm run loadtest` | the generator in `scripts/loadtest.mjs` — `TOTAL`, `CONCURRENCY`, `REJECT_RATIO`, `EDGE_URL`, `LOAD_KEY`. Hits the EDGE only; reports throughput and p50/p95/p99 |
 | `npm run down` | stop the containers (`-v` also wipes the ClickHouse volume) |
@@ -396,13 +397,16 @@ broker continuously. With kafkajs's defaults (`minBytes: 1`, `maxWaitTimeInMs:
 available, or empty after 5s. So "one batch" is not a configured size — it is
 whatever accumulated on the partition since the last fetch, capped at 1MB. At
 ~250 bytes per signal that is up to roughly 4,000 messages in a single batch,
-which is why `heartbeat()` between resolve calls is load-bearing rather than
+which is why `heartbeat()` around the resolve call is load-bearing rather than
 defensive.
 
 One batch is:
 
 1. parse the messages the edge produced
-2. one `/api/internal/resolve` call **per signal**, bounded concurrency
+2. **ONE** `/api/internal/resolve` call per chunk of `RESOLVE_BATCH_MAX` (2,000),
+   **not one per signal** — the per-message call was the pipeline's throughput
+   ceiling and a named Kafka anti-pattern. Payments caps a batch at 5,000
+   (`MAX_RESOLVE_BATCH`), so ours must stay under it
 3. ONE ClickHouse insert for the resolved prefix
 4. commit offsets — **last**, and only for what was actually written
 
@@ -416,7 +420,7 @@ At-least-once is the safe direction; an accepted signal is billable.
 consumer sets `autoCommit: false` deliberately so nothing commits behind its back —
 which makes the helper a silent no-op. It was caught against a live broker: batches
 logged `committed: 7` while the group's offset never moved, so every restart
-re-read and re-resolved the whole backlog at one HTTP call per signal.
+re-read and re-resolved the whole backlog from the start.
 `resolveOffset` is separate bookkeeping — it tells kafkajs what not to refetch, and
 commits nothing.
 
@@ -426,28 +430,31 @@ message but is a different object. Relying on `instanceof` after that trip made 
 refused shared secret exit 1 instead of 2 — systemd restarting forever instead of
 stopping with the reason on screen.
 
-**`heartbeat()` runs between resolve calls.** A batch of 500 signals is 500 HTTP
-calls — long enough that the broker decides the process is dead and rebalances the
-group mid-batch without it. This is the most common way a consumer like this
-breaks.
+**`heartbeat()` runs around the resolve call — before AND immediately after.** One
+call now carries up to 2,000 signals, so the call ITSELF is the long unheartbeated
+stretch, where it used to be the sum of many short ones. Miss it and the broker
+decides the process is dead and rebalances the group mid-batch. This is still the
+most common way a consumer like this breaks.
 
 **A batch commits its resolved PREFIX, not all-or-nothing.** `stoppedAt` is the
 index of the first message that could not be resolved; everything before it is
 written and committed, the rest is redelivered. Failing the whole batch would
-re-resolve 500 signals because #487 timed out — 500 HTTP calls already paid for.
+re-resolve every signal in it because one item came back transient.
 
-**Poison vs outage needs BOTH conditions, and the second is easy to drop.** A
-signal is quarantined (archived `PENDING`/`RESOLVE_FAILED` and stepped over) only
-when it has failed `RESOLVE_POISON_AFTER` times in a row **and** some other call
-has succeeded **since that streak began** (`succeededSinceStreak`).
+**Poison vs outage still needs BOTH conditions, but the second one got simpler.**
+A signal is quarantined (archived `PENDING`/`RESOLVE_FAILED` and stepped over) only
+when it has failed `RESOLVE_POISON_AFTER` times in a row **and the route
+demonstrably answered** — `verdict.routeAnswered`.
 
-The second condition is the definition, not a safety margin, and an elapsed-time
-proxy is NOT equivalent — that was observed failing against a live broker. Five
-failures accumulate in about five seconds; a two-minute outage window does not
-expire for another two minutes. So a success from 70 seconds ago made a route that
-was demonstrably down look alive, and a good signal was archived as a caller error
-during a real outage. It compares a monotonic success COUNT, not timestamps:
-batches complete inside one millisecond and a timestamp compare would tie.
+Batching made that DIRECT where it used to be inferred. With one call per signal,
+"this message is poison" and "the route is down" are indistinguishable from a
+single failure, so the old code compared a monotonic success COUNT
+(`succeededSinceStreak`) to prove some other call had got through. With one call
+per batch, a per-item `transient` inside a `200` is itself proof the route is up.
+Do not reintroduce the counter, and do not replace `routeAnswered` with an
+elapsed-time proxy — the time-based version was observed archiving good signals as
+caller errors during a real outage, because five failures accumulate in about five
+seconds while a two-minute window takes two minutes to expire.
 
 With nothing succeeding there is nothing to call a signal poison against, so the
 batch stalls and the runner exits once `RESOLVE_OUTAGE_MS` passes — systemd backs
@@ -555,11 +562,14 @@ Both workers: `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`,
 exits 2 without one).
 
 Consumer: `CONSUME_GROUP_ID` (changing it makes a NEW group with no offsets, which
-then re-resolves the topic one HTTP call at a time — change it deliberately),
-`CONSUME_CONCURRENCY` (the throughput ceiling), `CONSUME_FROM_BEGINNING` (a full
-replay), `RESOLVE_TIMEOUT_MS`, `RESOLVE_POISON_AFTER` and `RESOLVE_OUTAGE_MS` (the
-two halves of one rule — see the consumer section). It also reads the edge's
-`KAFKA_*` keys.
+then re-resolves the whole topic — change it deliberately), `RESOLVE_BATCH_MAX`
+(signals per resolve call, default 2,000; a request SIZE, not a concurrency
+ceiling, and it must stay under payments' `MAX_RESOLVE_BATCH` of 5,000),
+`CONSUME_FROM_BEGINNING` (a full replay), `RESOLVE_TIMEOUT_MS` (covers a WHOLE
+batch, not one signal — 30s, where 10s was right when a call meant one row),
+`RESOLVE_POISON_AFTER` and `RESOLVE_OUTAGE_MS` (see the consumer section). It also
+reads the edge's `KAFKA_*` keys. **`CONSUME_CONCURRENCY` is RETIRED** — read and
+ignored; there is no concurrency pool any more.
 
 Dispatcher: `DISPATCH_WINDOW_MS` (how far back, over `ingested_at`; keep it a
 multiple of the timer's interval), `DISPATCH_MAX_ROWS` (an OOM guard — hitting it
@@ -573,12 +583,12 @@ loses rows), `DISPATCH_TIMEOUT_MS` (must exceed settle's `maxDuration`),
   `docker/clickhouse/migrations/` (001–003), `infra/aws/`, every doc, and the
   e2e/trace scripts all landed. Do not assume anything here is uncommitted, and do
   not trust a file count in a note like this one — check `git status`.
-- **The Kafka→ClickHouse rewrite is IN THE WORKING TREE, not yet committed**:
-  `src/workers/consume/`, `src/client/resolve-client.ts`, the ClickHouse writer,
-  migrations `004`/`005`, the rewritten `01-schema.sql`, and
-  `deploy/systemd/signal-consumer.service`. 95 tests pass and both typechecks are
-  clean, but **`npm run e2e` cannot pass until the payments side lands** — see the
-  next bullet.
+- **The Kafka→ClickHouse rewrite is COMMITTED**, along with the batched resolve
+  (`cba7f03 feat(consume): one resolve call per batch, not per signal`,
+  `d86879e Made consumer batch`): `src/workers/consume/`,
+  `src/client/resolve-client.ts`, the ClickHouse writer, migrations `004`/`005`,
+  the rewritten `01-schema.sql`, and `deploy/systemd/signal-consumer.service`.
+  **104 tests pass** and both typechecks are clean.
 - What is on disk but **gitignored**, and therefore invisible to `git ls-files`:
   `.env`, `dist/`, `dist-lambda/` (the deleted Lambda pipeline's build output),
   `volume/` (LocalStack runtime state — a generated CA and server keys),
@@ -618,25 +628,29 @@ loses rows), `DISPATCH_TIMEOUT_MS` (must exceed settle's `maxDuration`),
   plus the two dispatch timers — the 1-minute pipeline run and the hourly
   reconciliation. The dispatcher still has no supervised long-lived process; the
   consumer is one, and is the only one.
-- **Payments-side changes this repo now assumes, none of them landed yet:**
-  - `/api/internal/resolve` must resolve the key **before** validating the body (so
-    a rejection still names an org), accept `customerId` and check it against that
-    org in the same call, answer **`403`** for a bad customer key with `401`
-    reserved for OUR shared secret, and keep `5xx` for its own faults. The `401`
-    split is the dangerous one: read as a customer problem it archives every signal
-    on the topic as a caller error, silently.
-  - `/api/internal/settle` must accept one call of arbitrary size (its 500 cap
-    gone, its per-signal walk replaced by a bulk insert), decompress a gzipped
-    body, and **trust the verdict** — use the supplied `organizationId` rather than
-    re-resolving, and for a `PENDING` signal record the terminal `SignalStatus`
-    without pricing anything.
-  - Note the shared secret now protects tenant **attribution**, not just access: a
-    leak lets a caller name any organisation, not merely replay signals.
-- **`scripts/e2e.mts` §11 still asserts the OLD cap** — `501 signals is refused,
-  not silently truncated` expects a 400 whose message names 501. That section
-  contradicts the bullet above and must be rewritten in the same change that lifts
-  the cap upstream, or a correct settle will fail the e2e. It is the only place
-  the two halves of this transition are pinned against each other.
+- **The payments side HAS LANDED** — verified 2026-09-01 on branch
+  `microservices/events` of `/home/joze/Documents/Work/Clocknext-Payment-Saas`. Do
+  not repeat the old "none of them landed yet" warning, and do not tell anyone to
+  expect the settle hops to fail:
+  - **`/api/internal/resolve` takes a batch**: `{ signals: [{ signalId, apiKeyHash,
+    body }, …] }`, capped at `MAX_RESOLVE_BATCH = 5_000` (ours sends 2,000). The
+    body may arrive gzipped, sniffed by magic number rather than trusted from a
+    header. `401` is reserved for OUR shared secret and nothing else may return it;
+    `400` means the ENVELOPE is malformed (our bug, never "all N signals are
+    invalid"); per-signal outcomes ride inside a `200`. The deprecated
+    single-signal shape still works for one release, routed through the same core.
+  - **`/api/internal/settle` takes a whole window**: the 500 cap is gone
+    (`MAX_BATCH = 200_000`), `maxDuration = 300`, the body is gzipped, and it
+    trusts a supplied `organizationId` instead of re-resolving. It adds two things
+    the unbounded batch needed — a dedup filter (`partitionBySettled`, since the 3×
+    overlap means most signals in a steady-state call already settled) and a
+    pricing DEADLINE that returns `DEADLINE_EXCEEDED` for unreached signals rather
+    than being killed mid-flight and making zero progress.
+  - The shared secret now protects tenant **attribution**, not just access: a leak
+    lets a caller name any organisation, not merely replay signals.
+- **`scripts/e2e.mts` no longer asserts the old 501 cap** — that contradiction is
+  resolved; the two halves of the transition are no longer pinned against each
+  other.
 - **The topic is on ONE partition**, and grows to 3 only on a measured symptom
   (ClickHouse ingestion lagging, or head-of-line blocking) — see
   [docs/AWS-SETUP.md](docs/AWS-SETUP.md) Step 0. Growing is **cheap here**, which
@@ -655,11 +669,14 @@ loses rows), `DISPATCH_TIMEOUT_MS` (must exceed settle's `maxDuration`),
   different knob (it is about a group with NO offsets at all), so do not assume
   the two are the same lever — verify before adding partitions. Partition count
   can never be lowered.
-- **Head-of-line blocking is now a real reason to add a partition**, where it was
-  once hypothetical. One HTTP call per signal, in topic order, on one partition is
-  this pipeline's throughput ceiling; watch `signal-resolver`'s lag.
+- **Resolve is NO LONGER the throughput ceiling.** One call now carries a whole
+  chunk of up to 2,000 signals, so the per-message HTTP round trip that capped the
+  pipeline near 150 signals/sec is gone. Sustained `signal-resolver` lag now points
+  at the ClickHouse insert, the payments database, or a partition count too low —
+  not at resolve. Head-of-line blocking is still a real reason to add a partition,
+  just a much less likely one.
 - No linter or formatter is configured. `npm run typecheck` is the only static
-  gate. As of the last sweep: 59 tests pass, both typechecks are clean.
+  gate. As of 2026-09-01: **104 tests pass**, both typechecks are clean.
 
 ## The AWS root (`infra/aws/`)
 
