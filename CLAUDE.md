@@ -593,11 +593,18 @@ loses rows), `DISPATCH_TIMEOUT_MS` (must exceed settle's `maxDuration`),
   LocalStack resources — untracked, unread, and never to be reused against a real
   account. `infra/aws/` is a SEPARATE root pointed at real AWS (see below).
   `terraform validate` passes; it has never been applied.
-- **`Environment=` in `dispatch-reconcile.service` beats `EnvironmentFile=`**,
-  which is how the hourly run gets its 2-hour window and 500k cap without a second
-  `.env`. `EnvironmentFile=` itself is not optional in either unit: `.env` is read
-  by the npm scripts, never by the code, so a direct `node dist/...` invocation
-  gets no configuration at all and exits 2 every minute.
+- **`EnvironmentFile=` BEATS `Environment=`, and `dispatch-reconcile.service`
+  shipped believing the opposite.** systemd.exec: *"Settings from these files
+  override settings made with `Environment=`"* — order in the unit is irrelevant.
+  So the hourly reconciliation's `Environment=DISPATCH_WINDOW_MS=7200000` lost to
+  `.env`'s 180000, and the run that exists to cover gaps the 1-minute overlap
+  cannot reach was an exact duplicate of the 1-minute timer. It now sets both
+  values on `ExecStart` via `/usr/bin/env`, applied after every file is read.
+  Verify by reading a live `dispatch.start` line, never the unit: it prints
+  `windowMs` and `maxRows`.
+- **`EnvironmentFile=` itself is not optional in either unit**: `.env` is read by
+  the npm scripts, never by the code, so a direct `node dist/...` invocation gets
+  no configuration at all and exits 2.
 - **All three worker units live at `/home/ubuntu/events-microservice` and run as
   `ubuntu`** — not `/srv`, and not a `dispatch` service account. The tree is a git
   checkout in a `0750` home directory that `git pull && npm run build` writes to as

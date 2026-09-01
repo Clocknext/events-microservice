@@ -23,13 +23,30 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/events-microservice
 EnvironmentFile=/home/ubuntu/events-microservice/.env
 
-# Environment= is applied AFTER EnvironmentFile=, so this wins over whatever
-# .env says. Two hours of ingestion, and a cap raised to match — the default
-# 100k would be hit by two hours of traffic that one minute clears easily.
+# THE WIDER WINDOW IS SET ON ExecStart, AND IT HAS TO BE.
+#
+# `Environment=` does NOT win here, whatever the ordering suggests. systemd.exec
+# is explicit: "Settings from these files override settings made with
+# Environment=" — so `EnvironmentFile=` above beats `Environment=` no matter
+# which appears first.
+#
+# This unit shipped with the two values below as `Environment=` lines and a
+# comment asserting the opposite, and it silently lost to `.env`: the hourly run
+# logged `windowMs:180000, maxRows:100000` and was an EXACT DUPLICATE of
+# dispatch.timer, with none of the gap-covering it exists for. Three consecutive
+# failed minute-ticks were supposed to be caught here, and would not have been.
+# Caught by reading a live `dispatch.start` line, not by reading the unit.
+#
+# `/usr/bin/env` sets them at exec time, after every file has been read, so no
+# `.env` can take them back. Two hours of ingestion, and a cap raised to match —
+# the default 100k would be hit by two hours of traffic that one minute clears.
+#
+# The `Environment=` lines are kept as documentation of intent, and are inert.
 Environment=DISPATCH_WINDOW_MS=7200000
 Environment=DISPATCH_MAX_ROWS=500000
 
-ExecStart=/usr/bin/node --max-old-space-size=2048 dist/workers/dispatch/dispatch.runner.js
+ExecStart=/usr/bin/env DISPATCH_WINDOW_MS=7200000 DISPATCH_MAX_ROWS=500000 \
+  /usr/bin/node --max-old-space-size=2048 dist/workers/dispatch/dispatch.runner.js
 TimeoutStartSec=900
 
 StandardOutput=journal

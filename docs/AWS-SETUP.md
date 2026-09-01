@@ -1500,6 +1500,22 @@ journalctl -u dispatch -f -o cat
 **✓ Check:** `list-timers` shows both timers with a *NEXT* time, and the journal
 shows a run within a minute.
 
+**✓ Check the RECONCILE run's window, from the log and not from the unit.** Trigger
+it by hand rather than waiting an hour:
+
+```bash
+sudo systemctl start dispatch-reconcile.service
+journalctl -u dispatch-reconcile -o cat | grep dispatch.start | tail -1
+```
+
+It must print `"windowMs":7200000,"maxRows":500000`. If it prints `180000` and
+`100000` it is reading `.env` instead of its own override and is an exact
+DUPLICATE of the 1-minute timer — the gap-covering it exists for is not happening.
+That is what this unit shipped doing: `Environment=` looks like it should win, and
+systemd.exec says the opposite — *"Settings from these files override settings made
+with `Environment=`"*. The values now live on `ExecStart` via `/usr/bin/env`, which
+is applied after every file has been read.
+
 Exit codes are the interface for both workers: **0** clean, **1** transient (for the
 dispatcher the next tick is the retry; for the consumer systemd restarts it), **2**
 misconfigured — every attempt will fail identically until a human acts. Details:

@@ -6,7 +6,7 @@ Three units, two binaries, and the difference in KIND is the point:
 | --- | --- | --- | --- |
 | `signal-consumer.service` | **always on** | — | drains Kafka, resolves each signal, writes `signal_log` |
 | `dispatch.timer` | one-shot | every 60s | 3 min window (`DISPATCH_WINDOW_MS`) — the pipeline |
-| `dispatch-reconcile.timer` | one-shot | hourly | 2 h window (overridden in the unit) — the safety net |
+| `dispatch-reconcile.timer` | one-shot | hourly | 2 h window, set on `ExecStart` — **not** `Environment=`, which `EnvironmentFile=` overrides. The safety net |
 
 **The consumer is a service because a Kafka consumer group member has to be.** One
 that started and exited every 60 seconds would spend its life rebalancing the
